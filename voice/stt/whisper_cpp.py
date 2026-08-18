@@ -60,6 +60,29 @@ def _write_wav_header(f, num_samples: int, sample_rate: int) -> None:
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
+# whisper.cpp's encoder always processes a fixed context window sized in
+# 20ms mel-spectrogram frames (50 frames/sec) regardless of actual audio
+# length -- n_audio_ctx=1500 is the model's built-in 30s cap. Benchmarked
+# on this UNO Q (base.en-q5_1, 4 threads): a 1.5s clip at the default full
+# context takes ~10s to encode; explicitly capping the context to roughly
+# match the real clip length (via whisper-cli's -ac flag) cuts that to
+# ~1.3s with an identical transcript -- encode time is the dominant cost
+# in the whole STT call (>85% of wall time), so this is the single biggest
+# lever found so far. Capping too aggressively is a *silent* failure mode,
+# not an error: a 10s clip fed -ac 256 (only enough context for ~5s)
+# didn't error, it made the decoder loop and repeat the first few seconds
+# of transcript three times. Must always be computed from the real audio
+# duration, with margin -- never a fixed constant.
+_MEL_FRAMES_PER_SECOND = 50
+_AUDIO_CTX_MARGIN = 1.3   # 30% headroom over the raw duration
+_AUDIO_CTX_MIN_PAD_FRAMES = 64  # +~1.3s flat pad, so very short clips still get a safe cushion
+_AUDIO_CTX_MAX_FRAMES = 1500    # whisper's own hard cap (30s)
+
+
+def _audio_ctx_for_duration(duration_s: float) -> int:
+    frames = int(duration_s * _MEL_FRAMES_PER_SECOND * _AUDIO_CTX_MARGIN) + _AUDIO_CTX_MIN_PAD_FRAMES
+    return min(frames, _AUDIO_CTX_MAX_FRAMES)
+
 
 class WhisperCppSTT:
     """Transcribe a speech segment using a local whisper.cpp binary."""
@@ -92,6 +115,8 @@ class WhisperCppSTT:
             return ""
 
         num_samples = len(raw_bytes) // 2
+        duration_s = num_samples / sample_rate
+        audio_ctx = _audio_ctx_for_duration(duration_s)
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = Path(tmp.name)
@@ -106,6 +131,7 @@ class WhisperCppSTT:
                     "-f", str(tmp_path),
                     "-t", str(self.config.threads),
                     "-l", self.config.language,
+                    "-ac", str(audio_ctx),
                     "--no-timestamps",
                     "-np",
                 ],

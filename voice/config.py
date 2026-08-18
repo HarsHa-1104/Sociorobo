@@ -75,7 +75,10 @@ class STTConfig:
 
     binary_path: str = "/opt/whisper.cpp/build/bin/whisper-cli"
     model_path: str = "/opt/whisper.cpp/models/ggml-base.en-q5_0.bin"
-    threads: int = 2
+    threads: int = 4  # UNO Q has exactly 4 cores; benchmarked encode time scales near-linearly
+                       # with threads (2->3->4 threads: ~19.6s->14.5s->10.1s on a 1.5s clip) and
+                       # Phase 1 has no other CPU-heavy process competing for cores. Revisit if a
+                       # future phase adds a concurrent vision/motor pipeline sharing this CPU.
     language: str = "en"
     timeout_s: float = 15.0  # shortened from the old project's 30s; short commands only
 

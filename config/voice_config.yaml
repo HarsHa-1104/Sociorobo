@@ -56,7 +56,10 @@ vad:
 stt:
   binary_path: "/home/arduino/Downloads/SocialRobot-UNOQ/runtime/whisper.cpp/build/bin/whisper-cli"
   model_path: "/home/arduino/Downloads/SocialRobot-UNOQ/runtime/whisper.cpp/models/ggml-base.en-q5_1.bin"
-  threads: 2
+  threads: 4   # raised from 2 -- measured on this UNO Q: encode time for a 1.5s clip went
+               # 19.6s (2 threads) -> 14.5s (3) -> 10.1s (4), near-linear scaling, and Phase 1
+               # has no other CPU-heavy process running concurrently. See voice/stt/whisper_cpp.py
+               # for the audio-ctx fix, which matters far more than thread count.
   language: "en"
   timeout_s: 60.0
 

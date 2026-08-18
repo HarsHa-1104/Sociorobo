@@ -23,7 +23,7 @@ def test_yaml_overrides_defaults(tmp_path):
     assert cfg.llm.timeout_s == 12.5
     assert cfg.vad.max_session_duration_s == 25
     # Untouched fields keep their defaults.
-    assert cfg.stt.threads == 2
+    assert cfg.stt.threads == 4
 
 
 def test_env_vars_override_yaml(tmp_path, monkeypatch):
