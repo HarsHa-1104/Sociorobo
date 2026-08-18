@@ -27,8 +27,21 @@ wake:
   model_path: null           # null = stock bundled model named below
   model_name: "hey_jarvis"   # stock, validated fallback -- see docs/MODEL_DECISION.md for the
                               # "hey_arduino" custom-training evaluation and how to switch to it
-  threshold: 0.45
-  trigger_level: 4
+  threshold: 0.35   # lowered from 0.45 -- real live-voice test on this board (6-7 spoken
+                     # utterances, see tests/fixtures/wake_live_scores.log) showed most real
+                     # utterances peak 0.36-0.44, well above the measured ambient-noise ceiling
+                     # of ~0.06 (>5x margin against false accepts).
+  trigger_level: 2   # lowered from 4 -- replaying the real captured score data through the
+                     # debounce logic (grid search over threshold x trigger_level) showed real
+                     # utterances almost never sustain 3+ consecutive 80ms frames above any
+                     # threshold in this range; 2 consecutive (160ms sustained) caught 4/6 real
+                     # utterances vs. 2/6 at the original 0.45/4, while still requiring genuine
+                     # sustained confidence, not a single-frame noise spike. The 2 remaining
+                     # misses only ever had one isolated frame above threshold, not two in a
+                     # row -- catching those would need dropping near the noise floor, which
+                     # isn't worth the added false-accept risk. Needs re-validation with a live
+                     # run (this was tuned by replaying already-captured data, not yet confirmed
+                     # in real time) and more ambient-noise sampling before calling this final.
   inference_framework: "onnx"
 
 vad:
