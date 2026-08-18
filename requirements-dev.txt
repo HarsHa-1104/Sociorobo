@@ -1,3 +1,7 @@
 -r requirements.txt
 pytest==8.3.3
 pytest-cov==5.0.0
+psutil==6.1.1  # used by scripts/benchmark_voice_pipeline.py for RSS/CPU measurement -- was
+                # imported there but never pinned anywhere, so a fresh dev setup would hit an
+                # ImportError running that script (found while completing Milestone 3's
+                # CPU/memory measurement requirement).
