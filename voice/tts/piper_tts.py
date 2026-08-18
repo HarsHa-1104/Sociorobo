@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 
 from voice.config import TTSConfig
+from voice.subprocess_utils import run_with_group_kill
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +75,14 @@ class PiperTTS:
             "--quiet",
         ]
         try:
-            result = subprocess.run(
+            # run_with_group_kill: Piper's espeak-ng phonemizer backend can
+            # shell out to a separate process -- a plain subprocess.run
+            # timeout would only kill the piper process itself and orphan
+            # that child (confirmed on real hardware during Milestone 7 with
+            # an equivalent hung-shell-script scenario).
+            result = run_with_group_kill(
                 cmd,
                 input=text.encode("utf-8"),
-                capture_output=True,
                 timeout=self.config.timeout_s,
             )
         except subprocess.TimeoutExpired:
@@ -112,10 +117,9 @@ class PiperTTS:
             "-q",
         ]
         try:
-            proc = subprocess.run(
+            proc = run_with_group_kill(
                 aplay_cmd,
                 input=pcm_bytes,
-                capture_output=True,
                 timeout=self.config.timeout_s,
             )
         except FileNotFoundError:

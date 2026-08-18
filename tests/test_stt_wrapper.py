@@ -47,7 +47,7 @@ def test_run_stt_parses_clean_transcript(stt_paths):
     fake_result = subprocess.CompletedProcess(
         args=[], returncode=0, stdout=" what is the weather tomorrow \n", stderr=""
     )
-    with mock.patch("subprocess.run", return_value=fake_result) as run_mock:
+    with mock.patch("voice.stt.whisper_cpp.run_with_group_kill", return_value=fake_result) as run_mock:
         text = stt.run_stt(b"\x00\x00" * 16000, sample_rate=16000)
     assert text == "what is the weather tomorrow"
     run_mock.assert_called_once()
@@ -63,7 +63,7 @@ def test_run_stt_strips_blank_audio_markers_and_ansi(stt_paths):
         stdout="[BLANK_AUDIO]\n\x1b[32mhello there\x1b[0m\n",
         stderr="",
     )
-    with mock.patch("subprocess.run", return_value=fake_result):
+    with mock.patch("voice.stt.whisper_cpp.run_with_group_kill", return_value=fake_result):
         text = stt.run_stt(b"\x00\x00" * 16000, sample_rate=16000)
     assert text == "hello there"
 
@@ -74,7 +74,7 @@ def test_run_stt_returns_empty_on_nonzero_exit(stt_paths):
     stt = WhisperCppSTT(cfg)
 
     fake_result = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
-    with mock.patch("subprocess.run", return_value=fake_result):
+    with mock.patch("voice.stt.whisper_cpp.run_with_group_kill", return_value=fake_result):
         text = stt.run_stt(b"\x00\x00" * 16000, sample_rate=16000)
     assert text == ""
 
@@ -84,7 +84,7 @@ def test_run_stt_returns_empty_on_timeout(stt_paths):
     cfg = STTConfig(binary_path=str(binary), model_path=str(model), timeout_s=1.0)
     stt = WhisperCppSTT(cfg)
 
-    with mock.patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="whisper-cli", timeout=1.0)):
+    with mock.patch("voice.stt.whisper_cpp.run_with_group_kill", side_effect=subprocess.TimeoutExpired(cmd="whisper-cli", timeout=1.0)):
         text = stt.run_stt(b"\x00\x00" * 16000, sample_rate=16000)
     assert text == ""
 
@@ -100,7 +100,7 @@ def test_run_stt_passes_duration_scaled_audio_ctx(stt_paths):
     stt = WhisperCppSTT(cfg)
 
     fake_result = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok\n", stderr="")
-    with mock.patch("subprocess.run", return_value=fake_result) as run_mock:
+    with mock.patch("voice.stt.whisper_cpp.run_with_group_kill", return_value=fake_result) as run_mock:
         # 1 second of 16kHz mono int16 audio.
         stt.run_stt(b"\x00\x00" * 16000, sample_rate=16000)
 

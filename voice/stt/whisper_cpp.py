@@ -27,6 +27,7 @@ import tempfile
 from pathlib import Path
 
 from voice.config import STTConfig
+from voice.subprocess_utils import run_with_group_kill
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +125,12 @@ class WhisperCppSTT:
             tmp.write(raw_bytes)
 
         try:
-            result = subprocess.run(
+            # run_with_group_kill, not subprocess.run: a plain subprocess.run
+            # timeout only kills whisper-cli itself, not any child process it
+            # might spawn -- confirmed on real hardware during Milestone 7
+            # that a timeout-killed process can leave orphaned children
+            # running indefinitely.
+            result = run_with_group_kill(
                 [
                     str(self.binary),
                     "-m", str(self.model),
@@ -135,7 +141,6 @@ class WhisperCppSTT:
                     "--no-timestamps",
                     "-np",
                 ],
-                capture_output=True,
                 text=True,
                 timeout=self.config.timeout_s,
             )

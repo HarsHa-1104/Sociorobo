@@ -38,7 +38,7 @@ def test_synthesize_returns_stdout_pcm(tts_paths):
     tts = PiperTTS(TTSConfig(binary_path=str(binary), model_path=str(model)))
     fake_pcm = b"\x01\x02" * 100
     fake_result = subprocess.CompletedProcess(args=[], returncode=0, stdout=fake_pcm, stderr=b"")
-    with mock.patch("subprocess.run", return_value=fake_result):
+    with mock.patch("voice.tts.piper_tts.run_with_group_kill", return_value=fake_result):
         pcm = tts.synthesize("hello")
     assert pcm == fake_pcm
 
@@ -47,7 +47,7 @@ def test_play_blocks_until_aplay_exits_and_reports_success(tts_paths):
     binary, model = tts_paths
     tts = PiperTTS(TTSConfig(binary_path=str(binary), model_path=str(model)))
     fake_result = subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b"")
-    with mock.patch("subprocess.run", return_value=fake_result) as run_mock:
+    with mock.patch("voice.tts.piper_tts.run_with_group_kill", return_value=fake_result) as run_mock:
         ok = tts.play(b"\x00\x00" * 100, alsa_device="default")
     assert ok is True
     run_mock.assert_called_once()
@@ -57,7 +57,7 @@ def test_play_reports_failure_on_nonzero_exit(tts_paths):
     binary, model = tts_paths
     tts = PiperTTS(TTSConfig(binary_path=str(binary), model_path=str(model)))
     fake_result = subprocess.CompletedProcess(args=[], returncode=1, stdout=b"", stderr=b"device busy")
-    with mock.patch("subprocess.run", return_value=fake_result):
+    with mock.patch("voice.tts.piper_tts.run_with_group_kill", return_value=fake_result):
         ok = tts.play(b"\x00\x00" * 100, alsa_device="default")
     assert ok is False
 
@@ -71,6 +71,6 @@ def test_play_empty_pcm_is_a_noop_success(tts_paths):
 def test_play_missing_aplay_reports_failure(tts_paths):
     binary, model = tts_paths
     tts = PiperTTS(TTSConfig(binary_path=str(binary), model_path=str(model)))
-    with mock.patch("subprocess.run", side_effect=FileNotFoundError()):
+    with mock.patch("voice.tts.piper_tts.run_with_group_kill", side_effect=FileNotFoundError()):
         ok = tts.play(b"\x00\x00" * 100, alsa_device="default")
     assert ok is False
