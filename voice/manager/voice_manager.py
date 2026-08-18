@@ -213,7 +213,15 @@ class VoiceManager:
     def _run_stt(self, speech_audio: bytes) -> str:
         self._transition(VoiceState.PROCESSING_STT)
         try:
-            transcript = self.stt.run_stt(speech_audio, sample_rate=self.config.audio.sample_rate)
+            # speech_audio comes from AudioManager.frames() via the segmenter,
+            # which always yields PIPELINE_SAMPLE_RATE (16kHz) audio -- NOT
+            # config.audio.sample_rate (the raw mic capture rate, 48kHz on
+            # this board). Passing the wrong rate here mislabels the WAV
+            # header STT sees, which is a real bug found on hardware during
+            # Milestone 6 (confirmed via saved temp WAVs: header said 48kHz
+            # for genuinely-16kHz data), not just cosmetic -- it corrupts
+            # whisper's duration/pitch interpretation of the audio entirely.
+            transcript = self.stt.run_stt(speech_audio, sample_rate=AudioManager.PIPELINE_SAMPLE_RATE)
         except Exception:
             logger.exception("STT raised unexpectedly")
             return ""
@@ -261,8 +269,16 @@ def build_voice_manager(config: VoiceSystemConfig) -> VoiceManager:
     constructing a VoiceManager.
     """
     audio = AudioManager(config.audio)
-    wake_detector = WakeWordDetector(config.wake, sample_rate=config.audio.sample_rate)
-    segmenter = SpeechSegmenter(config.vad, sample_rate=config.audio.sample_rate,
+    # Both of these consume frames from audio.frames(), which always yields
+    # PIPELINE_SAMPLE_RATE (16kHz) audio regardless of the raw mic capture
+    # rate (config.audio.sample_rate, 48kHz on this board) -- see the note
+    # in _run_stt() above for the real bug this class of mistake caused.
+    # SpeechSegmenter in particular feeds this straight into webrtcvad's
+    # is_speech(frame, sample_rate), which silently accepts a wrong-but-
+    # byte-length-compatible rate rather than raising, so this was corrupting
+    # every VAD decision on real hardware without ever erroring.
+    wake_detector = WakeWordDetector(config.wake, sample_rate=AudioManager.PIPELINE_SAMPLE_RATE)
+    segmenter = SpeechSegmenter(config.vad, sample_rate=AudioManager.PIPELINE_SAMPLE_RATE,
                                  frame_duration_ms=config.audio.frame_duration_ms)
     stt = WhisperCppSTT(config.stt)
     llm = OllamaClient(config.llm)

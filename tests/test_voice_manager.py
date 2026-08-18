@@ -88,9 +88,11 @@ class FakeSTT:
     def __init__(self, transcript: str = "what is the weather"):
         self.transcript = transcript
         self.calls = 0
+        self.last_sample_rate: Optional[int] = None
 
     def run_stt(self, audio: bytes, sample_rate: int) -> str:
         self.calls += 1
+        self.last_sample_rate = sample_rate
         return self.transcript
 
 
@@ -318,6 +320,38 @@ def test_humanfollower_unreachable_still_completes_session(config):
     still_alive = _run_one_cycle_in_thread(vm, timeout=5.0)
     assert not still_alive
     assert tts.played == ["It is sunny today."]
+
+
+def test_stt_always_receives_pipeline_rate_not_raw_capture_rate(config, running_reference_server):
+    """Regression test for a real bug found on UNO Q hardware: _run_stt()
+    used to pass config.audio.sample_rate (the raw mic capture rate --
+    48kHz on the real board) to WhisperCppSTT.run_stt(), but the audio
+    bytes it's given always come from AudioManager.frames(), which always
+    yields AudioManager.PIPELINE_SAMPLE_RATE (16kHz) regardless of the
+    capture rate. This mislabeled the WAV header STT builds, confirmed via
+    saved temp WAVs during live testing (header said 48kHz for genuinely
+    16kHz audio), and also fed the wrong rate into every
+    SpeechSegmenter.process_frame() -> webrtcvad.is_speech() call, which
+    accepts a wrong-but-byte-length-compatible rate silently rather than
+    raising -- so this corrupted VAD decisions with no error anywhere.
+
+    The default VoiceSystemConfig() has audio.sample_rate=16000, which
+    coincidentally equals the pipeline rate -- exactly why no test caught
+    this originally. This test deliberately sets a *different* capture
+    rate (48000, matching the real deployed config/voice_config.yaml) so
+    a regression can't hide behind that coincidence again.
+    """
+    config.audio.sample_rate = 48000
+    from voice.audio.manager import AudioManager as RealAudioManager
+
+    segmenter_script = [SegmentResult(SegmentEvent.SPEECH_ENDED, audio=b"\x00\x00" * 100)]
+    vm, audio, wake, seg, stt, llm, tts = _build_manager(config, segmenter_script)
+
+    still_alive = _run_one_cycle_in_thread(vm)
+    assert not still_alive
+
+    assert stt.last_sample_rate == RealAudioManager.PIPELINE_SAMPLE_RATE
+    assert stt.last_sample_rate != config.audio.sample_rate
 
 
 def test_two_consecutive_sessions_with_wake_enabled_do_not_crash(config, running_reference_server):
