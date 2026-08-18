@@ -1,0 +1,17 @@
+# Python dependencies for the Voice Manager.
+#
+# Corrected from the old project's requirements.txt, which listed
+# faster-whisper and kokoro-onnx -- Phase 1 found neither package is
+# actually imported anywhere in the real pipeline (whisper.cpp and Piper
+# are invoked as external subprocess binaries, installed separately by
+# scripts/setup_uno_q.sh, not via pip). pygame is dropped entirely -- the
+# GUI has been removed.
+
+numpy==1.26.4          # pinned <2.0 for broad ARM wheel availability; revisit if the
+                        # UNO Q's package index has good numpy>=2 aarch64 wheels
+PyAudio==0.2.14
+webrtcvad==2.0.10
+requests==2.32.3
+openwakeword==0.6.0
+onnxruntime==1.18.1     # openwakeword's inference backend (CPU build)
+PyYAML==6.0.2

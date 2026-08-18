@@ -1,0 +1,23 @@
+# Python dependencies for the Voice Manager.
+#
+# Corrected from the old project's requirements.txt, which listed
+# faster-whisper and kokoro-onnx -- Phase 1 found neither package is
+# actually imported anywhere in the real pipeline (whisper.cpp and Piper
+# are invoked as external subprocess binaries, installed separately by
+# scripts/setup_uno_q.sh, not via pip). pygame is dropped entirely -- the
+# GUI has been removed.
+
+numpy>=2.1,<3
+                        # UNO Q's package index has good numpy>=2 aarch64 wheels
+PyAudio==0.2.14
+webrtcvad==2.0.10
+requests==2.32.3
+openwakeword==0.6.0
+onnxruntime>=1.28,<2
+PyYAML==6.0.2
+
+# UNO Q / Python 3.13 ARM64:
+# openWakeWord 0.6.0 declares tflite-runtime on Linux, but this project
+# explicitly uses its ONNX inference path. Install openwakeword with
+# --no-deps after installing these dependencies.
+ai-edge-litert>=2.0.2,<3

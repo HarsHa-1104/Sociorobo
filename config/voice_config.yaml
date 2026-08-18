@@ -1,0 +1,83 @@
+# Voice Manager configuration.
+#
+# This file is optional -- every value here has a hard-coded default in
+# voice/config.py, and every value can also be overridden at runtime via
+# environment variables named VOICE_<SECTION>_<FIELD>, e.g.:
+#
+#     export VOICE_LLM_MODEL=qwen2.5:1.5b-instruct
+#     export VOICE_VAD_MAX_SESSION_DURATION_S=25
+#
+# Precedence: defaults < this file < environment variables.
+#
+# Values marked "MUST VERIFY ON DEVICE" are placeholders that were correct
+# for neither the old Jetson project nor any real UNO Q measurement -- they
+# need to be confirmed against the actual board during installation
+# (scripts/setup_uno_q.sh prints the discovered values).
+
+audio:
+  input_device_index: 2   # MUST VERIFY ON DEVICE -- run `python -m voice.audio.list_devices`
+  output_device: "hw:0,3"   # MUST VERIFY ON DEVICE -- do not assume the old project's HDMI ALSA device
+  sample_rate: 48000
+  channels: 1
+  frame_duration_ms: 30
+
+wake:
+  enabled: false
+  engine: "openwakeword"
+  model_path: null           # null = stock bundled model named below
+  model_name: "hey_jarvis"   # stock, validated fallback -- see docs/MODEL_DECISION.md for the
+                              # "hey_arduino" custom-training evaluation and how to switch to it
+  threshold: 0.45
+  trigger_level: 4
+  inference_framework: "onnx"
+
+vad:
+  aggressiveness: 2
+  padding_duration_ms: 400
+  activation_ratio: 0.6
+  deactivation_ratio: 0.85
+  no_speech_timeout_s: 6.0        # Section 8A: 5-7s window, no speech after wake word
+  max_session_duration_s: 20.0    # Section 8B: hard ceiling only, not a target
+  post_tts_cooldown_s: 0.5
+
+stt:
+  binary_path: "/home/arduino/Downloads/SocialRobot-UNOQ/runtime/whisper.cpp/build/bin/whisper-cli"
+  model_path: "/home/arduino/Downloads/SocialRobot-UNOQ/runtime/whisper.cpp/models/ggml-base.en-q5_1.bin"
+  threads: 2
+  language: "en"
+  timeout_s: 60.0
+
+llm:
+  url: "http://localhost:11434/api/chat"
+  model: "gemma3:270m"       # see docs/MODEL_DECISION.md -- evidence-based choice for a 2GB budget
+  stream: true
+  timeout_s: 60.0
+  num_predict: 96
+  temperature: 0.6
+  keep_alive: "10m"
+  system_prompt: >-
+    You are a helpful voice assistant on a small mobile robot.
+    Answer in one short sentence, two at most.
+    Do not use lists, markdown, or emoji. Be direct and concise.
+
+tts:
+  binary_path: "/home/arduino/Downloads/SocialRobot-UNOQ/runtime/piper/piper"
+  model_path: "/home/arduino/Downloads/SocialRobot-UNOQ/runtime/piper/voices/en_US-lessac-medium.onnx"
+  model_json_path: null
+  sample_rate: 22050
+  timeout_s: 60.0
+
+ipc:
+  socket_path: "/tmp/humanfollower_voice.sock"
+  connect_timeout_s: 3.0
+  message_timeout_s: 5.0
+  heartbeat_interval_s: 2.0
+  pause_confirm_timeout_s: 8.0
+
+watchdog:
+  max_paused_duration_s: 45.0
+  heartbeat_timeout_s: 6.0
+
+logging:
+  level: "INFO"
+  log_dir: "/var/log/voice_manager"

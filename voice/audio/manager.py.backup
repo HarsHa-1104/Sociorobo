@@ -1,0 +1,163 @@
+"""Shared Audio Manager -- the single owner of the microphone.
+
+Phase 1 finding this preserves: the old project's ``VADListener`` already
+did the right thing by opening exactly one PyAudio stream and gating it via
+``start_stream()``/``stop_stream()`` instead of repeatedly opening and
+closing the device. That pattern is the one documented cause of ALSA
+device-busy problems the user has hit before, and this module keeps it.
+
+What's new here: the old code had exactly one consumer (VAD). This module
+generalises that into "one stream, N consumers" so a wake-word detector and
+the VAD/STT session can both read from the same stream without fighting
+over the device -- per the Phase 1 recommendation and the Phase 2 spec's
+Section 10 diagram.
+
+This module deliberately knows nothing about wake words, VAD state
+machines, or sessions. It just owns the device and hands out frames. That
+keeps it trivially testable (see tests/test_audio_manager.py) and keeps
+hardware-specific fragility in one small, well-isolated place.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from typing import Iterator, Optional
+
+from voice.config import AudioConfig
+
+logger = logging.getLogger(__name__)
+
+try:
+    import pyaudio
+except ImportError:  # pragma: no cover - only available where PortAudio is installed
+    pyaudio = None  # type: ignore
+
+
+class MicrophoneUnavailableError(RuntimeError):
+    """Raised when the configured input device cannot be opened."""
+
+
+class AudioManager:
+    """Owns exactly one microphone stream and hands frames to callers.
+
+    Usage::
+
+        mgr = AudioManager(config.audio)
+        mgr.start()
+        for frame in mgr.frames():
+            ...
+        mgr.stop()
+
+    ``suspend()``/``resume()`` gate the stream (stop_stream/start_stream)
+    without closing the underlying device handle -- this is what lets the
+    Voice Manager silence audio capture entirely during TTS playback
+    (Section 15/7 of the spec: the robot must never hear its own voice)
+    without paying the cost, or the ALSA-device-busy risk, of a full
+    close+reopen cycle.
+    """
+
+    def __init__(self, config: AudioConfig) -> None:
+        if pyaudio is None:
+            raise RuntimeError(
+                "pyaudio is not installed. Install PortAudio + PyAudio "
+                "(see scripts/setup_uno_q.sh) before running the Voice Manager."
+            )
+        self.config = config
+        self.frame_size = int(config.sample_rate * config.frame_duration_ms / 1000)
+
+        self._pa: Optional["pyaudio.PyAudio"] = None
+        self._stream = None
+        self._suspended = threading.Event()
+        self._stop_flag = threading.Event()
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        with self._lock:
+            if self._stream is not None:
+                return  # already started -- idempotent by design
+            self._pa = pyaudio.PyAudio()
+            try:
+                self._stream = self._pa.open(
+                    format=pyaudio.paInt16,
+                    channels=self.config.channels,
+                    rate=self.config.sample_rate,
+                    input=True,
+                    frames_per_buffer=self.frame_size,
+                    input_device_index=self.config.input_device_index,
+                )
+            except Exception as exc:  # pragma: no cover - depends on real hardware
+                self._pa.terminate()
+                self._pa = None
+                raise MicrophoneUnavailableError(
+                    f"Could not open microphone (device_index="
+                    f"{self.config.input_device_index}): {exc}"
+                ) from exc
+            self._stop_flag.clear()
+            logger.info(
+                "AudioManager started: device=%s rate=%dHz frame=%dms (%d samples)",
+                self.config.input_device_index,
+                self.config.sample_rate,
+                self.config.frame_duration_ms,
+                self.frame_size,
+            )
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_flag.set()
+            if self._stream is not None:
+                try:
+                    if self._stream.is_active():
+                        self._stream.stop_stream()
+                    self._stream.close()
+                except Exception:  # pragma: no cover - best-effort teardown
+                    logger.exception("Error closing audio stream")
+                self._stream = None
+            if self._pa is not None:
+                self._pa.terminate()
+                self._pa = None
+            logger.info("AudioManager stopped")
+
+    # ------------------------------------------------------------------
+    def suspend(self) -> None:
+        """Stop reading audio without closing the device (used during TTS)."""
+        self._suspended.set()
+        if self._stream is not None and self._stream.is_active():
+            self._stream.stop_stream()
+
+    def resume(self) -> None:
+        self._suspended.clear()
+        if self._stream is not None and not self._stream.is_active():
+            self._stream.start_stream()
+
+    @property
+    def is_suspended(self) -> bool:
+        return self._suspended.is_set()
+
+    # ------------------------------------------------------------------
+    def frames(self) -> Iterator[bytes]:
+        """Yield raw int16 mono PCM frames until :meth:`stop` is called.
+
+        Yields nothing while :meth:`suspend` is in effect (busy-waits at a
+        cadence of one frame interval so callers get a live generator they
+        can just keep iterating without special-casing suspension).
+        """
+        if self._stream is None:
+            raise RuntimeError("AudioManager.start() must be called before frames()")
+
+        frame_interval = self.config.frame_duration_ms / 1000.0
+        while not self._stop_flag.is_set():
+            if self._suspended.is_set():
+                threading.Event().wait(frame_interval)
+                continue
+            try:
+                data = self._stream.read(self.frame_size, exception_on_overflow=False)
+            except OSError as exc:  # pragma: no cover - real hardware only
+                logger.warning("Audio read error (device likely disconnected): %s", exc)
+                threading.Event().wait(frame_interval)
+                continue
+            yield data
+
+
+__all__ = ["AudioManager", "MicrophoneUnavailableError"]
