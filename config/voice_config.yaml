@@ -16,7 +16,14 @@
 
 audio:
   input_device_index: 2   # MUST VERIFY ON DEVICE -- run `python -m voice.audio.list_devices`
-  output_device: "hw:0,3"   # MUST VERIFY ON DEVICE -- do not assume the old project's HDMI ALSA device
+  output_device: "plughw:0,3"   # Milestone 5 finding: hw:0,3's ALSA hw params only support RATE
+                                  # [32000, 48000] -- Piper's native output is 22050Hz. Raw hw:0,3
+                                  # doesn't error on the mismatch, it silently coerces to 32000Hz
+                                  # (confirmed via `aplay --dump-hw-params`: "Warning: rate is not
+                                  # accurate (requested = 22050Hz, got = 32000Hz)"), which played
+                                  # audibly too fast when a human listened. plughw:0,3 (same
+                                  # physical device, ALSA's plug layer does real resampling) showed
+                                  # no such warning. Still NOT "default" -- still explicitly hw:0,3.
   sample_rate: 48000
   channels: 1
   frame_duration_ms: 30
