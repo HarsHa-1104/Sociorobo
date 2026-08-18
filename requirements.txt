@@ -12,12 +12,24 @@ numpy>=2.1,<3
 PyAudio==0.2.14
 webrtcvad==2.0.10
 requests==2.32.3
-openwakeword==0.6.0
 onnxruntime>=1.28,<2
 PyYAML==6.0.2
 
 # UNO Q / Python 3.13 ARM64:
-# openWakeWord 0.6.0 declares tflite-runtime on Linux, but this project
-# explicitly uses its ONNX inference path. Install openwakeword with
-# --no-deps after installing these dependencies.
+# openWakeWord 0.6.0 declares a hard dependency on tflite-runtime on Linux,
+# which has no aarch64/Python 3.13 wheel and is not used anyway -- this
+# project only exercises openWakeWord's ONNX inference path
+# (inference_framework="onnx" in config/voice_config.yaml). Confirmed on
+# this exact board: `pip install openwakeword==0.6.0` (no --no-deps) fails
+# to resolve for this reason. Fix: install openwakeword with --no-deps
+# (scripts/setup_uno_q.sh does this), after explicitly pinning the rest of
+# openwakeword's *actual* runtime deps here so they're still installed --
+# `pip show openwakeword` on this board confirms it imports scipy,
+# scikit-learn, and tqdm directly, none of which were previously pinned
+# anywhere, so a from-scratch install of `openwakeword==0.6.0 --no-deps`
+# followed by this file alone would have left those missing.
+scipy==1.18.0
+scikit-learn==1.9.0
+tqdm==4.70.0
+openwakeword==0.6.0
 ai-edge-litert>=2.0.2,<3

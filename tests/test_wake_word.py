@@ -59,22 +59,31 @@ def test_constructor_always_passes_explicit_single_model_list(fake_oww):
     assert fake_oww.last_kwargs["wakeword_models"] == ["/opt/wake/hey_arduino.onnx"]
 
 
+# WakeWordDetector.process_frame() buffers input and only calls the model
+# once _audio_buffer reaches 1280 samples (2560 bytes) -- matching
+# openWakeWord's own documented chunk-size contract (model.py: "audio data
+# ... (1280 samples), with longer lengths reducing overall CPU usage"). A
+# frame this size drives exactly one model.predict() call per
+# process_frame() call below, so scripted_scores lines up 1:1 with calls.
+_MODEL_FRAME = b"\x00\x00" * 1280
+
+
 def test_fires_only_after_trigger_level_consecutive_hits(fake_oww):
     cfg = WakeConfig(model_name="hey_jarvis", threshold=0.5, trigger_level=3)
     det = WakeWordDetector(cfg, sample_rate=16000)
     det._model.scripted_scores = [0.9, 0.9]  # only 2 consecutive hits -- below trigger_level=3
-    assert det.process_frame(b"\x00\x00") is False
-    assert det.process_frame(b"\x00\x00") is False
+    assert det.process_frame(_MODEL_FRAME) is False
+    assert det.process_frame(_MODEL_FRAME) is False
 
     det._model.scripted_scores = [0.9]  # 3rd consecutive hit -- fires now
-    assert det.process_frame(b"\x00\x00") is True
+    assert det.process_frame(_MODEL_FRAME) is True
 
 
 def test_single_low_score_frame_resets_the_debounce_counter(fake_oww):
     cfg = WakeConfig(model_name="hey_jarvis", threshold=0.5, trigger_level=3)
     det = WakeWordDetector(cfg, sample_rate=16000)
     det._model.scripted_scores = [0.9, 0.9, 0.1, 0.9, 0.9]
-    results = [det.process_frame(b"\x00\x00") for _ in range(5)]
+    results = [det.process_frame(_MODEL_FRAME) for _ in range(5)]
     # The dip below threshold at index 2 must reset the streak, so 2
     # trailing high scores (indices 3-4) are not enough to fire.
     assert results == [False, False, False, False, False]
@@ -84,7 +93,7 @@ def test_reset_clears_debounce_and_forwards_to_model(fake_oww):
     cfg = WakeConfig(model_name="hey_jarvis", threshold=0.5, trigger_level=2)
     det = WakeWordDetector(cfg, sample_rate=16000)
     det._model.scripted_scores = [0.9]
-    det.process_frame(b"\x00\x00")  # 1 hit, not yet fired
+    det.process_frame(_MODEL_FRAME)  # 1 hit, not yet fired
     det.reset()
     assert det._consecutive_hits == 0
     assert det._model.reset_calls == 1

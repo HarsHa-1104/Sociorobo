@@ -65,7 +65,13 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 pip install --upgrade pip
-pip install -r "$(dirname "$0")/../requirements.txt"
+# openwakeword must install with --no-deps: it declares a hard dependency
+# on tflite-runtime on Linux, which has no aarch64/Python 3.13 wheel and
+# isn't used (this project only exercises openWakeWord's ONNX inference
+# path). Its other real runtime deps (scipy, scikit-learn, tqdm) are pinned
+# directly in requirements.txt instead -- see the comment there.
+grep -v '^openwakeword' "$(dirname "$0")/../requirements.txt" | pip install -r /dev/stdin
+pip install --no-deps openwakeword==0.6.0
 
 echo
 echo "=== Step 4: whisper.cpp (build from source) ==="
