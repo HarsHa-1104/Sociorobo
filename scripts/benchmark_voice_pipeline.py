@@ -222,24 +222,28 @@ def main() -> int:
         print("Benchmarking wake word...")
         results["wake_word"] = bench_wake_word(config)
 
-        print("Benchmarking STT candidates (edit this list to match what pull_models.sh fetched)...")
-        stt_candidates = [
-            "/opt/whisper.cpp/models/ggml-base.en-q5_0.bin",
-            "/opt/whisper.cpp/models/ggml-base.en-q5_1.bin",
-            "/opt/whisper.cpp/models/ggml-tiny.en-q5_1.bin",
-            "/opt/whisper.cpp/models/ggml-tiny.en-q8_0.bin",
-        ]
+        # NOTE: these used to be hardcoded to /opt/whisper.cpp/... and
+        # /opt/piper/... paths that don't exist anywhere in this project --
+        # this repo installs everything under runtime/ (see
+        # scripts/setup_uno_q.sh), so every candidate was silently filtered
+        # out by the Path(p).exists() check below and this script benchmarked
+        # nothing for STT/TTS. Discovered by actually running this script on
+        # the real UNO Q during Milestone 4 -- fixed to glob the real
+        # runtime/ layout instead of a second hardcoded path list that can
+        # drift out of sync with it again.
+        project_root = Path(__file__).resolve().parent.parent
+        print("Benchmarking STT candidates (whatever's actually present under runtime/whisper.cpp/models/)...")
+        stt_candidates = sorted(str(p) for p in
+                                 (project_root / "runtime/whisper.cpp/models").glob("ggml-*.bin"))
         results["stt"] = {p: bench_stt(p, config) for p in stt_candidates if Path(p).exists()}
 
         print("Benchmarking LLM candidates...")
         llm_candidates = ["gemma3:270m", "qwen2.5:1.5b-instruct"]
         results["llm"] = {m: bench_llm(m, config) for m in llm_candidates}
 
-        print("Benchmarking TTS candidates...")
-        tts_candidates = [
-            "/opt/piper/voices/en_US-lessac-medium.onnx",
-            "/opt/piper/voices/en_US-lessac-high.onnx",
-        ]
+        print("Benchmarking TTS candidates (whatever's actually present under runtime/piper/voices/)...")
+        tts_candidates = sorted(str(p) for p in
+                                 (project_root / "runtime/piper/voices").glob("*.onnx"))
         results["tts"] = {p: bench_tts(p, config) for p in tts_candidates if Path(p).exists()}
 
     finally:
