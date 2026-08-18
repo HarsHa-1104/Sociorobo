@@ -167,6 +167,47 @@ def _build_manager(config, segmenter_script, stt="what is the weather",
     return vm, audio, wake, segmenter, stt_fake, llm_fake, tts_fake
 
 
+def _run_n_cycles_in_thread(vm: VoiceManager, n: int, timeout: float = 5.0):
+    """Like _run_one_cycle_in_thread, but waits for `n` full sessions and
+    reports whether run_forever's thread crashed (as opposed to just not
+    finishing in time).
+
+    Regression coverage for a real crash found on UNO Q hardware during
+    Milestone 6 end-to-end testing: with wake.enabled=True (the real
+    code path, not the debug bypass), nothing transitioned
+    SESSION_COMPLETE -> WAKE_LISTENING before the second wake fire, so
+    _run_session()'s first move (-> PAUSE_PENDING) crashed with
+    IllegalTransitionError on the second cycle. Every other test in this
+    file only runs one cycle, which structurally could never have caught
+    this -- see voice/manager/voice_manager.py's _wait_for_wake() fix.
+
+    Returns (thread_still_alive, thread_crashed).
+    """
+    crashed = threading.Event()
+
+    def _run():
+        try:
+            vm.run_forever()
+        except Exception:
+            crashed.set()
+            raise
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if crashed.is_set():
+            break
+        if vm._session_count >= n and vm.state == VoiceState.WAKE_LISTENING:
+            break
+        if not t.is_alive():
+            break
+        time.sleep(0.02)
+    vm.stop()
+    t.join(timeout=2.0)
+    return t.is_alive(), crashed.is_set()
+
+
 def _run_one_cycle_in_thread(vm: VoiceManager, timeout: float = 3.0):
     """Runs run_forever() in a background thread and stops it shortly after
     the manager returns to WAKE_LISTENING following one full session (or
@@ -277,6 +318,43 @@ def test_humanfollower_unreachable_still_completes_session(config):
     still_alive = _run_one_cycle_in_thread(vm, timeout=5.0)
     assert not still_alive
     assert tts.played == ["It is sunny today."]
+
+
+def test_two_consecutive_sessions_with_wake_enabled_do_not_crash(config, running_reference_server):
+    """Regression test for a real crash found on UNO Q hardware: the
+    second wake-word fire (real detection path, not the wake-disabled
+    bypass) used to attempt SESSION_COMPLETE -> PAUSE_PENDING directly,
+    which the state graph rejects and which crashed run_forever's whole
+    thread with an unhandled IllegalTransitionError. See
+    voice/manager/voice_manager.py's _wait_for_wake() fix and its
+    docstring for the full story.
+    """
+    server, events = running_reference_server
+    assert config.wake.enabled is True  # this must exercise the real detection path
+
+    segmenter_script = [SegmentResult(SegmentEvent.SPEECH_ENDED, audio=b"\x00\x00" * 100)]
+    # Two full cycles: [wake1, listen1, wake2, listen2].
+    wake_frame_batches = [
+        [b"WAKE"],
+        [f"F{i}".encode() for i in range(len(segmenter_script))],
+        [b"WAKE"],
+        [f"G{i}".encode() for i in range(len(segmenter_script))],
+    ]
+    audio = FakeAudioManager(wake_frame_batches)
+    wake = FakeWakeWordDetector()
+    segmenter = FakeSegmenter(segmenter_script * 2)
+    stt = FakeSTT("what is the weather")
+    llm = FakeLLM("It is sunny today.")
+    tts = FakeTTS(True)
+    vm = VoiceManager(config, audio, wake, segmenter, stt, llm, tts)
+
+    still_alive, crashed = _run_n_cycles_in_thread(vm, n=2)
+    assert not crashed, "run_forever crashed instead of completing 2 sessions"
+    assert not still_alive
+    assert vm._session_count == 2
+    assert vm.state == VoiceState.WAKE_LISTENING
+    assert stt.calls == 2
+    assert tts.played == ["It is sunny today.", "It is sunny today."]
 
 
 def test_max_duration_timeout_with_partial_audio_still_runs_stt(config, running_reference_server):

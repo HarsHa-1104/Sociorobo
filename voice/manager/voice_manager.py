@@ -106,9 +106,20 @@ class VoiceManager:
     def _wait_for_wake(self) -> bool:
         """Wait for wake word, or immediately start a session when disabled."""
 
+        # Must happen unconditionally, before either branch below: a real
+        # wake-word fire (the loop just below) never transitioned state
+        # itself -- it only returned True -- so _run_session()'s first move
+        # (WAKE_LISTENING -> PAUSE_PENDING) would otherwise be attempted
+        # from SESSION_COMPLETE on the second and every later cycle, which
+        # the state graph correctly rejects and crashes the whole process.
+        # Confirmed on real UNO Q hardware: this was masked in every prior
+        # test because none of them ran a second cycle, and masked in
+        # manual testing while wake was disabled, because the bypass branch
+        # below happened to do this transition itself already.
+        if self._state == VoiceState.SESSION_COMPLETE:
+            self._transition(VoiceState.WAKE_LISTENING)
+
         if not self.config.wake.enabled:
-            if self._state == VoiceState.SESSION_COMPLETE:
-                self._transition(VoiceState.WAKE_LISTENING)
             logger.info("Wake disabled -- starting voice session directly.")
             return True
 
