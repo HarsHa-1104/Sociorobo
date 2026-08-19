@@ -109,6 +109,12 @@ tts:
   model_json_path: null
   sample_rate: 22050
   timeout_s: 60.0
+  persistent: true   # Milestone 8 (Priority 2): validated on real hardware -- keeps one Piper
+                      # process resident instead of reloading the model on every call.
+  bluetooth_speaker_mac: "B3:BB:BE:7F:9B:1A"   # HBTS001 -- the actual production speaker.
+                      # Routes playback through PipeWire (pw-play) via voice/tts/pipewire_playback.py,
+                      # found dynamically by MAC on every call. aplay/ALSA cannot reach this device
+                      # at all (confirmed on real hardware -- no PipeWire-ALSA compat plugin).
 
 ipc:
   socket_path: "/tmp/humanfollower_voice.sock"
