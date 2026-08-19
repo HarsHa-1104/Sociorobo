@@ -157,6 +157,20 @@ class WhisperCppSTT:
             logger.warning("whisper.cpp error: %s", result.stderr.strip())
             return ""
 
+        # Milestone 8 baseline profiling: whisper.cpp already prints its own
+        # internal encode/decode timing breakdown to stderr on every run --
+        # surface it instead of discarding it, so the real bottleneck within
+        # STT (encode vs decode vs sampling) is measured directly against
+        # real production utterances, not re-derived from a separate
+        # synthetic benchmark.
+        timing_lines = [
+            line.strip() for line in result.stderr.splitlines()
+            if "whisper_print_timings:" in line and ("time" in line)
+        ]
+        if timing_lines:
+            logger.info("whisper.cpp internal timing (audio_ctx=%d): %s",
+                        audio_ctx, " | ".join(timing_lines))
+
         cleaned = []
         for line in result.stdout.splitlines():
             line = _ANSI_RE.sub("", line).strip()

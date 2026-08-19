@@ -133,13 +133,22 @@ class VoiceManager:
 
     # ------------------------------------------------------------------
     def _run_session(self) -> None:
+        # Milestone 8: per-stage wall-clock timing, logged as a single
+        # structured summary at the end of every session (INFO level, not
+        # DEBUG -- this is the baseline profiling data, meant to be always
+        # available for future optimization work, not a one-off measurement).
+        session_t0 = time.perf_counter()
+        stage_durations_s: dict = {}
+
         # Wake word must not be able to re-fire on our own audio for the
         # rest of this cycle -- suspend immediately (Section 7).
         self.audio.suspend()
 
         link = HumanFollowerLink(self.config.ipc)
         self._transition(VoiceState.PAUSE_PENDING)
+        t0 = time.perf_counter()
         confirmed = link.request_pause()
+        stage_durations_s["pause_handshake"] = time.perf_counter() - t0
         if not confirmed:
             logger.warning(
                 "Proceeding into LISTENING without PAUSE_CONFIRMED "
@@ -147,23 +156,44 @@ class VoiceManager:
             )
         link.start_heartbeat()
 
+        t0 = time.perf_counter()
         outcome, speech_audio = self._listen_for_utterance()
+        stage_durations_s["listening"] = time.perf_counter() - t0
         if speech_audio is None:
+            self._log_session_timing(stage_durations_s, session_t0, outcome)
             self._end_session(link, outcome)
             return
 
+        t0 = time.perf_counter()
         transcript = self._run_stt(speech_audio)
+        stage_durations_s["stt"] = time.perf_counter() - t0
         if not transcript:
+            self._log_session_timing(stage_durations_s, session_t0, "stt_empty_or_failed")
             self._end_session(link, "stt_empty_or_failed")
             return
 
+        t0 = time.perf_counter()
         reply = self._run_llm(transcript)
+        stage_durations_s["llm"] = time.perf_counter() - t0
         if not reply:
+            self._log_session_timing(stage_durations_s, session_t0, "llm_empty_or_failed")
             self._end_session(link, "llm_empty_or_failed")
             return
 
+        t0 = time.perf_counter()
         outcome = self._run_tts(reply)
+        stage_durations_s["tts"] = time.perf_counter() - t0
+
+        self._log_session_timing(stage_durations_s, session_t0, outcome)
         self._end_session(link, outcome)
+
+    def _log_session_timing(self, stages: dict, session_t0: float, outcome: str) -> None:
+        total = time.perf_counter() - session_t0
+        breakdown = " ".join(f"{name}={dur:.2f}s" for name, dur in stages.items())
+        logger.info(
+            "Session timing: total=%.2fs outcome=%s [%s]",
+            total, outcome, breakdown,
+        )
 
     # ------------------------------------------------------------------
     def _listen_for_utterance(self):
@@ -282,7 +312,16 @@ def build_voice_manager(config: VoiceSystemConfig) -> VoiceManager:
                                  frame_duration_ms=config.audio.frame_duration_ms)
     stt = WhisperCppSTT(config.stt)
     llm = OllamaClient(config.llm)
-    tts = PiperTTS(config.tts)
+    # Milestone 8: config.tts.persistent selects PersistentPiperTTS (keeps
+    # one Piper process alive across requests, ~2-5x faster on real-hardware
+    # benchmarks -- see docs/MILESTONE_8_PIPER_OPTIMIZATION.md) over the
+    # original per-call PiperTTS. Both implement the same interface, so this
+    # is the only place the choice is made.
+    if config.tts.persistent:
+        from voice.tts.persistent_piper_tts import PersistentPiperTTS
+        tts = PersistentPiperTTS(config.tts)
+    else:
+        tts = PiperTTS(config.tts)
 
     return VoiceManager(config, audio, wake_detector, segmenter, stt, llm, tts)
 

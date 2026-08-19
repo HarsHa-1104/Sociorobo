@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -135,11 +136,30 @@ class PiperTTS:
         return True
 
     def synthesize_and_play(self, text: str, alsa_device: str) -> bool:
-        """Convenience wrapper: synthesize, then block until playback finishes."""
+        """Convenience wrapper: synthesize, then block until playback finishes.
+
+        Logs the synth/play split explicitly (Milestone 8 baseline
+        profiling) -- VoiceManager only sees the combined TTS stage
+        duration, and Piper's per-call subprocess/model-load overhead was
+        flagged back in Milestone 5 as a real, unconfirmed suspicion; this
+        makes it measurable instead of assumed.
+        """
+        t0 = time.perf_counter()
         pcm = self.synthesize(text)
+        synth_s = time.perf_counter() - t0
         if not pcm:
+            logger.info("TTS timing: synth=%.2fs play=skipped (empty synthesis)", synth_s)
             return False
-        return self.play(pcm, alsa_device)
+
+        t0 = time.perf_counter()
+        ok = self.play(pcm, alsa_device)
+        play_s = time.perf_counter() - t0
+        audio_s = len(pcm) / 2 / self.config.sample_rate
+        logger.info(
+            "TTS timing: synth=%.2fs play=%.2fs audio_len=%.2fs synth_rtf=%.2f",
+            synth_s, play_s, audio_s, (synth_s / audio_s if audio_s else 0.0),
+        )
+        return ok
 
 
 __all__ = ["PiperTTS", "TTSError"]

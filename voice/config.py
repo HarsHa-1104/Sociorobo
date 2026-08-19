@@ -110,6 +110,20 @@ class TTSConfig:
     model_json_path: Optional[str] = None  # derived from model_path + ".json" if unset
     sample_rate: int = 22050
     timeout_s: float = 20.0
+    persistent: bool = False  # Milestone 8: PersistentPiperTTS keeps one Piper process alive
+                               # across requests instead of reloading the ONNX model every call
+                               # (measured directly: ~1.9-2.4s reload cost per call, eliminated
+                               # after the first request). Default False until human-confirmed
+                               # audible quality matches the original -- see the Milestone 8
+                               # commit for the real-hardware benchmark and confirmation.
+    bluetooth_speaker_mac: Optional[str] = None  # Milestone 8: the production speaker (e.g. a
+                               # Bluetooth device like "HBTS001") only exists as a PipeWire node --
+                               # confirmed on real hardware that `aplay` cannot reach it at all (no
+                               # PipeWire-ALSA compat plugin installed). When set, playback is
+                               # routed via pw-play to whichever PipeWire node currently has this
+                               # MAC as its api.bluez5.address, looked up fresh on every call (never
+                               # a cached/hardcoded sink id -- those are reassigned on every
+                               # reconnect). None keeps the original aplay/ALSA path unchanged.
 
 
 @dataclass
