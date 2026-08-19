@@ -15,7 +15,12 @@
 # (scripts/setup_uno_q.sh prints the discovered values).
 
 audio:
-  input_device_index: 2   # MUST VERIFY ON DEVICE -- run `python -m voice.audio.list_devices`
+  input_device_index: 0   # Milestone 8 (Priority 3): was 2, but the USB mic's PyAudio index
+                           # shifted to 0 after this session's WirePlumber restarts/lightdm stop
+                           # (same underlying ALSA-renumbering root cause as the output_device fix
+                           # above) -- confirmed via `python -m voice.audio.list_devices`. PyAudio
+                           # indices aren't guaranteed stable across audio-stack reconfiguration;
+                           # re-verify with the same command if the mic ever stops opening.
   output_device: "plughw:CARD=ArduinoImolaHPH,DEV=3"
     # Milestone 5 finding: this codec's hw params only support RATE
     # [32000, 48000] -- Piper's native output is 22050Hz. A raw "hw:" device
