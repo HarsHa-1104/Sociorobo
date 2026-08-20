@@ -111,10 +111,27 @@ tts:
   timeout_s: 60.0
   persistent: true   # Milestone 8 (Priority 2): validated on real hardware -- keeps one Piper
                       # process resident instead of reloading the model on every call.
-  bluetooth_speaker_mac: "B3:BB:BE:7F:9B:1A"   # HBTS001 -- the actual production speaker.
-                      # Routes playback through PipeWire (pw-play) via voice/tts/pipewire_playback.py,
-                      # found dynamically by MAC on every call. aplay/ALSA cannot reach this device
-                      # at all (confirmed on real hardware -- no PipeWire-ALSA compat plugin).
+  speaker_mode: "auto"   # Plug-and-play Phase 1 (default, shipped explicitly for clarity --
+                      # this is also the dataclass default, so this line isn't load-bearing).
+                      # "auto": every call discovers every currently-available PipeWire output
+                      # (Bluetooth and ALSA/USB alike, via voice/audio/discovery.py +
+                      # selection.py) and picks the best one -- Bluetooth > USB > built-in,
+                      # with a "stick to the previous pick" rule to avoid gratuitous switching.
+                      # No config edit needed when the physical speaker changes.
+                      # "pinned": restrict selection to exactly speaker_pin (or, if that's
+                      # unset, bluetooth_speaker_mac below) -- fails clearly instead of
+                      # silently using a different device if the pinned one isn't present.
+                      # Use this only for debugging or a deliberately fixed deployment.
+  speaker_pin: null   # Only consulted when speaker_mode: "pinned". A stable_id from
+                      # voice/audio/discovery.py -- a Bluetooth MAC or an ALSA card name.
+  bluetooth_speaker_mac: "B3:BB:BE:7F:9B:1A"   # HBTS001. Milestone 8: routes playback through
+                      # PipeWire (pw-play), found dynamically by MAC on every call -- aplay/ALSA
+                      # cannot reach this device at all (confirmed on real hardware -- no
+                      # PipeWire-ALSA compat plugin). Plug-and-play Phase 1: kept here, set, as
+                      # a backward-compatible pin value for speaker_mode: "pinned" -- with
+                      # speaker_mode: "auto" (the default above), this field is NOT consulted;
+                      # HBTS001 is instead selected automatically because it's the
+                      # highest-priority device when actually connected, not because of this MAC.
 
 ipc:
   socket_path: "/tmp/humanfollower_voice.sock"

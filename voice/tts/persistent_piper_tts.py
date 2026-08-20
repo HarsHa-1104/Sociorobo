@@ -35,6 +35,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from voice.audio.discovery import discover_output_devices, pipewire_reachable
+from voice.audio.selection import SelectionError, make_output_selector
 from voice.config import TTSConfig
 
 logger = logging.getLogger(__name__)
@@ -70,6 +72,10 @@ class PersistentPiperTTS:
 
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
+        # Plug-and-play Phase 1: one output selector for this TTS instance's
+        # lifetime, so "sticky previous selection" (see voice/audio/selection.py)
+        # actually means something across calls instead of resetting every time.
+        self._output_selector = make_output_selector()
 
         # Load eagerly at construction time -- the ~2s model-load cost
         # happens once at app startup, not on the first real user request.
@@ -196,34 +202,72 @@ class PersistentPiperTTS:
 
     # ------------------------------------------------------------------
     def play(self, pcm_bytes: bytes, alsa_device: str) -> bool:
-        """Routes to the production Bluetooth speaker via PipeWire when
-        configured (config.tts.bluetooth_speaker_mac is set); otherwise
-        identical to the original PiperTTS's aplay/ALSA path.
+        """Plug-and-play Phase 1: routes to whichever output device
+        voice/audio/discovery.py + selection.py currently resolve as the
+        best available PipeWire sink -- Bluetooth or ALSA/USB alike, never
+        a hardcoded MAC or sink id. `config.tts.speaker_mode` controls
+        whether that's a free automatic pick ("auto", the default) or
+        restricted to one explicitly pinned device ("pinned").
 
-        Confirmed on real hardware (Milestone 8): aplay cannot reach a
-        Bluetooth sink at all on this board -- there is no PipeWire-ALSA
-        compatibility plugin installed, so `alsa_device` is simply the
-        wrong kind of target for Bluetooth output. The Bluetooth node is
-        looked up fresh by MAC address on every call, never cached --
-        PipeWire reassigns its numeric id (and could in principle change
-        its node.name) on every reconnect.
+        `alsa_device` is kept only as a last-resort fallback for the rare
+        case PipeWire itself is unreachable (not just "no sinks right
+        now") -- see _resolve_output_target(). It is never used while
+        PipeWire is working, even if PipeWire currently reports zero
+        sinks: that case fails clearly instead of silently playing to a
+        fixed ALSA device nobody may be listening to (confirmed on real
+        hardware, Milestone 8: the built-in HPH jack is unused/off).
         """
         if not pcm_bytes:
             return True
 
-        if self.config.bluetooth_speaker_mac:
-            from voice.tts.pipewire_playback import find_bluez_sink_target, play_via_pipewire
+        target_node, failure_reason = self._resolve_output_target()
 
-            target = find_bluez_sink_target(self.config.bluetooth_speaker_mac)
-            if target is None:
-                logger.error(
-                    "Bluetooth speaker %s not found as a PipeWire sink -- "
-                    "is it connected? Not falling back to ALSA silently.",
-                    self.config.bluetooth_speaker_mac,
-                )
-                return False
-            return play_via_pipewire(pcm_bytes, self.config.sample_rate, target, self.config.timeout_s)
+        if target_node is not None:
+            from voice.tts.pipewire_playback import play_via_pipewire
+            return play_via_pipewire(pcm_bytes, self.config.sample_rate, target_node, self.config.timeout_s)
 
+        if failure_reason == "pipewire_unreachable" and alsa_device:
+            logger.warning(
+                "PipeWire itself is unreachable (pw-dump missing/erroring) -- "
+                "falling back to the configured ALSA device %s as a last "
+                "resort. This is a degraded path, not normal operation.",
+                alsa_device,
+            )
+            return self._play_via_aplay(pcm_bytes, alsa_device)
+
+        logger.error(
+            "No usable output device selected (%s) -- not falling back to "
+            "an unintended device.", failure_reason,
+        )
+        return False
+
+    def _resolve_output_target(self) -> tuple[Optional[str], Optional[str]]:
+        """Returns (pipewire_node_name, None) on success, or
+        (None, failure_reason) on failure. failure_reason is one of:
+        "pipewire_unreachable" (pw-dump itself is missing/erroring/timing
+        out -- discovery can't even ask PipeWire), "no_devices" (PipeWire
+        is fine, it just currently has zero sinks), or "selection_failed"
+        (candidates exist but the configured pin doesn't match any of
+        them). Distinguishing "pipewire_unreachable" from "no_devices"
+        matters because only the former is eligible for the aplay
+        fallback in play() -- see that method's docstring.
+        """
+        candidates = discover_output_devices()
+        if not candidates:
+            if pipewire_reachable():
+                return None, "no_devices"
+            return None, "pipewire_unreachable"
+
+        pin = self.config.speaker_pin or self.config.bluetooth_speaker_mac
+        try:
+            chosen = self._output_selector.select(candidates, mode=self.config.speaker_mode, pin=pin)
+        except SelectionError as exc:
+            logger.error("Speaker selection failed: %s", exc)
+            return None, "selection_failed"
+
+        return chosen.pipewire_node_name, None
+
+    def _play_via_aplay(self, pcm_bytes: bytes, alsa_device: str) -> bool:
         from voice.subprocess_utils import run_with_group_kill
 
         aplay_cmd = [

@@ -132,53 +132,120 @@ def test_shutdown_stops_the_process(fake_config):
     assert proc.poll() is not None, "process must actually be terminated after shutdown()"
 
 
-def test_play_uses_aplay_when_no_bluetooth_mac_configured(fake_config):
-    """Default behaviour (bluetooth_speaker_mac unset) must be unchanged
-    from before this milestone -- routes through aplay/ALSA."""
+def _output_device(stable_id, backend, node, alsa_driver=None):
+    from voice.audio.discovery import DeviceDescriptor
+    return DeviceDescriptor(
+        role="output", backend=backend, stable_id=stable_id, display_name=stable_id,
+        pipewire_node_name=node, alsa_driver=alsa_driver,
+    )
+
+
+_HBTS001 = _output_device("B3:BB:BE:7F:9B:1A", "bluez5", "bluez_output.B3_BB_BE_7F_9B_1A.1")
+_USB_SPEAKER = _output_device("Audio Array AM-C28 Device", "alsa", "alsa_output.usb", alsa_driver="snd_usb_audio")
+
+
+def test_play_auto_mode_discovers_and_routes_via_pipewire_with_no_config(fake_config):
+    """Plug-and-play Phase 1: with NO bluetooth_speaker_mac and NO pin
+    configured (the shipped default: speaker_mode='auto'), play() must
+    still find and use whatever PipeWire output is actually available --
+    no config edit required."""
+    assert fake_config.speaker_mode == "auto"
     assert fake_config.bluetooth_speaker_mac is None
+    assert fake_config.speaker_pin is None
     tts = PersistentPiperTTS(fake_config)
     try:
-        with mock.patch("voice.subprocess_utils.run_with_group_kill",
-                         return_value=_ok_subprocess_result()) as run_mock:
+        with mock.patch("voice.tts.persistent_piper_tts.discover_output_devices",
+                         return_value=[_HBTS001]), \
+             mock.patch("voice.tts.pipewire_playback.play_via_pipewire", return_value=True) as play_mock:
             ok = tts.play(b"\x00\x00" * 100, alsa_device="plughw:CARD=Test,DEV=3")
         assert ok is True
-        called_cmd = run_mock.call_args[0][0]
-        assert called_cmd[0] == "aplay"
-    finally:
-        tts.shutdown()
-
-
-def test_play_routes_via_pipewire_when_bluetooth_mac_configured(fake_config):
-    fake_config.bluetooth_speaker_mac = "B3:BB:BE:7F:9B:1A"
-    tts = PersistentPiperTTS(fake_config)
-    try:
-        with mock.patch("voice.tts.pipewire_playback.find_bluez_sink_target",
-                         return_value="bluez_output.B3_BB_BE_7F_9B_1A.1") as find_mock, \
-             mock.patch("voice.tts.pipewire_playback.play_via_pipewire",
-                         return_value=True) as play_mock:
-            ok = tts.play(b"\x00\x00" * 100, alsa_device="plughw:CARD=Test,DEV=3")
-        assert ok is True
-        find_mock.assert_called_once_with("B3:BB:BE:7F:9B:1A")
-        play_mock.assert_called_once()
         assert play_mock.call_args[0][2] == "bluez_output.B3_BB_BE_7F_9B_1A.1"
     finally:
         tts.shutdown()
 
 
-def test_play_fails_visibly_when_bluetooth_sink_not_found_not_silent_alsa_fallback(fake_config):
-    """If the configured Bluetooth speaker isn't currently a PipeWire
-    sink (e.g. disconnected), play() must fail and say so -- not silently
-    fall back to playing on the built-in ALSA device nobody's listening
-    to, which would look like success while producing no audible output
-    on the actual production speaker."""
+def test_play_auto_mode_prefers_bluetooth_over_usb_when_both_present(fake_config):
+    tts = PersistentPiperTTS(fake_config)
+    try:
+        with mock.patch("voice.tts.persistent_piper_tts.discover_output_devices",
+                         return_value=[_USB_SPEAKER, _HBTS001]), \
+             mock.patch("voice.tts.pipewire_playback.play_via_pipewire", return_value=True) as play_mock:
+            tts.play(b"\x00\x00" * 100, alsa_device="plughw:CARD=Test,DEV=3")
+        assert play_mock.call_args[0][2] == "bluez_output.B3_BB_BE_7F_9B_1A.1"
+    finally:
+        tts.shutdown()
+
+
+def test_play_pinned_mode_uses_bluetooth_speaker_mac_as_backward_compatible_pin(fake_config):
+    """The legacy bluetooth_speaker_mac field still works exactly as
+    before, but only once speaker_mode is explicitly set to 'pinned' --
+    it's no longer consulted in the default 'auto' mode."""
+    fake_config.speaker_mode = "pinned"
     fake_config.bluetooth_speaker_mac = "B3:BB:BE:7F:9B:1A"
     tts = PersistentPiperTTS(fake_config)
     try:
-        with mock.patch("voice.tts.pipewire_playback.find_bluez_sink_target", return_value=None), \
+        with mock.patch("voice.tts.persistent_piper_tts.discover_output_devices",
+                         return_value=[_USB_SPEAKER, _HBTS001]), \
+             mock.patch("voice.tts.pipewire_playback.play_via_pipewire", return_value=True) as play_mock:
+            ok = tts.play(b"\x00\x00" * 100, alsa_device="plughw:CARD=Test,DEV=3")
+        assert ok is True
+        assert play_mock.call_args[0][2] == "bluez_output.B3_BB_BE_7F_9B_1A.1"
+    finally:
+        tts.shutdown()
+
+
+def test_play_pinned_mode_fails_visibly_when_pinned_device_absent_never_substitutes(fake_config):
+    """If the pinned Bluetooth speaker isn't currently a PipeWire sink
+    (e.g. disconnected) while OTHER outputs exist, play() must fail and
+    say so -- not silently substitute a different device, which would
+    look like success while producing no audible output on the actual
+    intended speaker."""
+    fake_config.speaker_mode = "pinned"
+    fake_config.bluetooth_speaker_mac = "B3:BB:BE:7F:9B:1A"
+    tts = PersistentPiperTTS(fake_config)
+    try:
+        with mock.patch("voice.tts.persistent_piper_tts.discover_output_devices",
+                         return_value=[_USB_SPEAKER]), \
+             mock.patch("voice.subprocess_utils.run_with_group_kill") as aplay_mock, \
+             mock.patch("voice.tts.pipewire_playback.play_via_pipewire") as pw_play_mock:
+            ok = tts.play(b"\x00\x00" * 100, alsa_device="plughw:CARD=Test,DEV=3")
+        assert ok is False
+        aplay_mock.assert_not_called()
+        pw_play_mock.assert_not_called()
+    finally:
+        tts.shutdown()
+
+
+def test_play_fails_visibly_when_pipewire_reports_zero_devices_no_aplay_fallback(fake_config):
+    """PipeWire itself working but currently reporting zero sinks must
+    fail clearly -- it must NOT fall back to the fixed ALSA device, since
+    that device (the built-in HPH jack on this board) was already
+    confirmed unused/off, so a silent fallback would report success while
+    nothing audible happens."""
+    tts = PersistentPiperTTS(fake_config)
+    try:
+        with mock.patch("voice.tts.persistent_piper_tts.discover_output_devices", return_value=[]), \
+             mock.patch("voice.tts.persistent_piper_tts.pipewire_reachable", return_value=True), \
              mock.patch("voice.subprocess_utils.run_with_group_kill") as aplay_mock:
             ok = tts.play(b"\x00\x00" * 100, alsa_device="plughw:CARD=Test,DEV=3")
         assert ok is False
         aplay_mock.assert_not_called()
+    finally:
+        tts.shutdown()
+
+
+def test_play_falls_back_to_aplay_only_when_pipewire_itself_is_unreachable(fake_config):
+    """The ONLY scenario where the legacy aplay/ALSA path may still run:
+    PipeWire itself is missing/erroring (not just "no sinks right now")."""
+    tts = PersistentPiperTTS(fake_config)
+    try:
+        with mock.patch("voice.tts.persistent_piper_tts.discover_output_devices", return_value=[]), \
+             mock.patch("voice.tts.persistent_piper_tts.pipewire_reachable", return_value=False), \
+             mock.patch("voice.subprocess_utils.run_with_group_kill",
+                         return_value=_ok_subprocess_result()) as run_mock:
+            ok = tts.play(b"\x00\x00" * 100, alsa_device="plughw:CARD=Test,DEV=3")
+        assert ok is True
+        assert run_mock.call_args[0][0][0] == "aplay"
     finally:
         tts.shutdown()
 

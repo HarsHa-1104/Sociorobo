@@ -116,14 +116,25 @@ class TTSConfig:
                                # after the first request). Default False until human-confirmed
                                # audible quality matches the original -- see the Milestone 8
                                # commit for the real-hardware benchmark and confirmation.
+    speaker_mode: str = "auto"  # Plug-and-play Phase 1: "auto" (default) discovers and ranks
+                               # every currently-available PipeWire output (Bluetooth and
+                               # ALSA/USB alike) via voice/audio/discovery.py + selection.py on
+                               # every call -- no MAC/config edit needed when the speaker
+                               # changes. "pinned" restricts selection to exactly one device (see
+                               # speaker_pin) and fails clearly rather than substituting another
+                               # device if it's absent -- for debugging/special deployments only.
+    speaker_pin: Optional[str] = None  # Only consulted when speaker_mode == "pinned". A stable_id
+                               # (see voice/audio/discovery.py) -- a Bluetooth MAC or an ALSA card
+                               # name. If unset, bluetooth_speaker_mac below is used as a
+                               # backward-compatible fallback pin value.
     bluetooth_speaker_mac: Optional[str] = None  # Milestone 8: the production speaker (e.g. a
                                # Bluetooth device like "HBTS001") only exists as a PipeWire node --
                                # confirmed on real hardware that `aplay` cannot reach it at all (no
-                               # PipeWire-ALSA compat plugin installed). When set, playback is
-                               # routed via pw-play to whichever PipeWire node currently has this
-                               # MAC as its api.bluez5.address, looked up fresh on every call (never
-                               # a cached/hardcoded sink id -- those are reassigned on every
-                               # reconnect). None keeps the original aplay/ALSA path unchanged.
+                               # PipeWire-ALSA compat plugin installed). Plug-and-play Phase 1: this
+                               # field is now ONLY consulted when speaker_mode == "pinned" (and only
+                               # as a fallback if speaker_pin isn't also set) -- it no longer drives
+                               # normal automatic operation, kept for backward compatibility with
+                               # existing deployments/configs that pin it explicitly.
 
 
 @dataclass
