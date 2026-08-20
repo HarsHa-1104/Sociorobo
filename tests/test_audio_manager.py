@@ -61,13 +61,41 @@ class _FakeStream:
         self.closed = True
 
 
+FAKE_USB_MIC = {
+    "name": "Fake USB Mic: USB Audio (hw:0,0)",
+    "maxInputChannels": 1, "maxOutputChannels": 0, "defaultSampleRate": 16000.0,
+}
+DIFFERENT_USB_MIC = {
+    "name": "Different USB Mic: USB Audio (hw:2,0)",
+    "maxInputChannels": 1, "maxOutputChannels": 0, "defaultSampleRate": 16000.0,
+}
+
+
 class _FakePyAudio:
-    """Represents ONE PyAudio host instance. Its identity matters: the
-    fix under test must never construct a second one during recovery."""
+    """Represents ONE PyAudio host instance. Its identity matters: Tier 1
+    recovery under test must never construct a second one; Tier 2
+    (rediscovery) deliberately does, exactly once per attempt.
+
+    get_device_count()/get_device_info_by_index() read owner.device_list
+    live (not a snapshot frozen at construction time) -- unlike real
+    PortAudio, which DOES freeze its enumeration at construction (see
+    voice/audio/manager.py's _attempt_device_rediscovery docstring for why
+    that matters and why this class always constructs a genuinely new host
+    for Tier 2 rather than reusing one). Modeling live reads here is fine
+    because nothing in the code under test ever reuses a stale fake host
+    for discovery -- only ever a freshly-constructed one -- so there is no
+    staleness behavior for this fake to get wrong.
+    """
 
     def __init__(self, owner):
         self.owner = owner
         self.instance_id = owner.pyaudio_init_calls  # snapshot at construction time
+
+    def get_device_count(self):
+        return len(self.owner.device_list)
+
+    def get_device_info_by_index(self, i):
+        return self.owner.device_list[i]
 
     def open(self, **kwargs):
         self.owner.open_calls += 1
@@ -80,7 +108,7 @@ class _FakePyAudio:
         return stream
 
     def terminate(self):
-        pass
+        self.owner.terminate_calls += 1
 
 
 class _Owner:
@@ -93,10 +121,13 @@ class _Owner:
         self.fail_reopen = False
         self.open_calls = 0
         self.read_calls = 0
+        self.terminate_calls = 0
         self.last_stream = None
         self.hang_on_open_s = 0.0  # simulates pa.open() blocking
         self.pyaudio_init_calls = 0  # how many times pyaudio.PyAudio() itself was constructed
-        self.cards_present = True  # whether /proc/asound/cards (faked) currently shows the USB card
+        self.cards_present = True  # whether /proc/asound/cards (faked) currently shows the ORIGINAL USB card
+        self.different_usb_present = False  # whether it instead shows a DIFFERENT USB card (Tier 2 territory)
+        self.device_list = [dict(FAKE_USB_MIC)]  # what discovery currently finds via PyAudio enumeration
 
 
 @pytest.fixture
@@ -109,14 +140,18 @@ def fake_pyaudio(monkeypatch, tmp_path):
 
     fake_module = types.SimpleNamespace(paInt16=8, PyAudio=_construct)
     monkeypatch.setattr("voice.audio.manager.pyaudio", fake_module)
+    monkeypatch.setattr("voice.audio.discovery.pyaudio", fake_module)
 
     # Fake /proc/asound/cards as a real temp file so _mic_physically_present()
-    # exercises its real file-reading code path, not a mocked shortcut.
+    # /_any_usb_audio_card_present() exercise their real file-reading code
+    # path, not a mocked shortcut.
     cards_path = tmp_path / "fake_asound_cards"
 
     def _write_cards():
         if owner.cards_present:
             cards_path.write_text(" 1 [Device ]: USB-Audio - Fake USB Mic\n                      Fake USB Mic at usb-1.1, full speed\n")
+        elif owner.different_usb_present:
+            cards_path.write_text(" 2 [Other  ]: USB-Audio - Different USB Mic\n                      Different USB Mic at usb-2.1, full speed\n")
         else:
             cards_path.write_text(" 0 [Other ]: not-usb - Some Other Card\n")
 
@@ -124,19 +159,26 @@ def fake_pyaudio(monkeypatch, tmp_path):
     owner._write_cards = _write_cards  # let tests re-trigger a write after flipping cards_present
     monkeypatch.setattr(AudioManager, "ASOUND_CARDS_PATH", str(cards_path))
 
+    # Discovery also queries pw-dump for Bluetooth/PipeWire input candidates
+    # -- irrelevant to these PyAudio/ALSA-focused tests, so make it a no-op
+    # (empty result) rather than letting it hit a real subprocess.
+    monkeypatch.setattr("voice.audio.discovery._run_pw_dump", lambda: [])
+
     return owner
 
 
-def _fast_config():
-    return AudioConfig(input_device_index=0, sample_rate=16000, channels=1, frame_duration_ms=5)
+def _fast_config(**overrides):
+    kwargs = dict(sample_rate=16000, channels=1, frame_duration_ms=5)
+    kwargs.update(overrides)
+    return AudioConfig(**kwargs)
 
 
-def _make_manager(monkeypatch, max_errors=3, max_reopen=3, backoff=(0.02, 0.02, 0.02), reopen_timeout=3.0):
+def _make_manager(monkeypatch, max_errors=3, max_reopen=3, backoff=(0.02, 0.02, 0.02), reopen_timeout=3.0, **config_overrides):
     monkeypatch.setattr(AudioManager, "MAX_CONSECUTIVE_READ_ERRORS", max_errors)
     monkeypatch.setattr(AudioManager, "MAX_REOPEN_ATTEMPTS", max_reopen)
     monkeypatch.setattr(AudioManager, "REOPEN_BACKOFF_S", backoff)
     monkeypatch.setattr(AudioManager, "REOPEN_TIMEOUT_S", reopen_timeout)
-    return AudioManager(_fast_config())
+    return AudioManager(_fast_config(**config_overrides))
 
 
 # ---------------------------------------------------------------------------
@@ -312,8 +354,14 @@ def test_stop_during_presence_polling_returns_promptly(fake_pyaudio, monkeypatch
 def test_reopen_that_fails_to_open_is_retried_up_to_the_bound(fake_pyaudio, monkeypatch):
     """A reopen attempt where pa.open() itself raises (not just a
     subsequent read) must also count against the bounded attempts, not
-    loop forever or skip counting -- while never reconstructing PyAudio."""
-    audio = _make_manager(monkeypatch, max_errors=1, max_reopen=3, backoff=(0.01,) * 3)
+    loop forever or skip counting -- while never reconstructing PyAudio.
+
+    Uses microphone_mode="pinned" specifically to isolate Tier 1 mechanics
+    from Tier 2 (rediscovery, tested separately below) -- pinned mode never
+    attempts Tier 2 at all, matching its "never substitute a different
+    device" contract."""
+    audio = _make_manager(monkeypatch, max_errors=1, max_reopen=3, backoff=(0.01,) * 3,
+                           microphone_mode="pinned", microphone_pin="Fake USB Mic")
     audio.start()
     fake_pyaudio.broken = True
     fake_pyaudio.fail_reopen = True  # every reopen attempt's open() itself raises
@@ -355,6 +403,109 @@ def test_reopen_that_hangs_is_bounded_by_timeout_not_left_hanging(fake_pyaudio, 
     assert frame is not None
     assert elapsed < 2.0, f"took {elapsed:.2f}s -- the hang was not bounded"
     assert fake_pyaudio.pyaudio_init_calls == 1, "must never reconstruct PyAudio, even to work around a hang"
+    audio.stop()
+
+
+def test_start_resolves_device_via_discovery_by_stable_id_not_raw_index(fake_pyaudio, monkeypatch):
+    """Plug-and-play Phase 2: start() must resolve the microphone through
+    discovery/selection (stable_id), not a hand-set input_device_index --
+    the default config has no index or pin at all."""
+    audio = _make_manager(monkeypatch)
+    audio.start()
+    assert audio._resolved_stable_id == "Fake USB Mic"
+    assert audio._resolved_pyaudio_index == 0
+    audio.stop()
+
+
+def test_start_pinned_mode_fails_clearly_when_pin_absent(fake_pyaudio, monkeypatch):
+    """A pinned microphone that isn't currently discoverable must raise
+    MicrophoneUnavailableError at start() -- never silently fall back to
+    whatever else discovery found."""
+    from voice.audio.manager import MicrophoneUnavailableError
+
+    audio = _make_manager(monkeypatch, microphone_mode="pinned", microphone_pin="Nonexistent Mic")
+    with pytest.raises(MicrophoneUnavailableError):
+        audio.start()
+    assert fake_pyaudio.open_calls == 0, "must never open a stream for an unresolved pin"
+
+
+def test_tier2_rediscovery_swaps_to_a_different_microphone_when_original_is_gone(fake_pyaudio, monkeypatch):
+    """The core Phase 2 recovery requirement: if the original mic never
+    comes back but a genuinely DIFFERENT USB microphone is now present,
+    auto-mode recovery must find and switch to it -- reconstructing
+    PyAudio exactly once for this (Tier 2), never silently giving up while
+    a usable alternative exists."""
+    audio = _make_manager(monkeypatch, max_errors=1, max_reopen=2, backoff=(0.01,) * 2,
+                           microphone_mode="auto")
+    audio.start()
+    assert fake_pyaudio.pyaudio_init_calls == 1
+
+    fake_pyaudio.broken = True  # triggers the initial read error that enters recovery
+
+    def _replace_with_different_device_shortly_after():
+        # Give frames() a moment to hit the initial read error and enter
+        # Tier 1 (which will skip every attempt via the presence check,
+        # since cards_present becomes False below) before switching the
+        # simulated hardware out from under it.
+        time.sleep(0.02)
+        fake_pyaudio.cards_present = False         # original device's signature: gone
+        fake_pyaudio.different_usb_present = True  # a DIFFERENT USB card is now visible at the OS level
+        fake_pyaudio.device_list = [dict(DIFFERENT_USB_MIC)]  # ...and PyAudio now enumerates it
+        fake_pyaudio._write_cards()
+        # Tier 1 never actually reaches a real read (presence-gated skip) --
+        # only Tier 2's freshly opened stream does, and that read must
+        # succeed for rediscovery to declare success.
+        fake_pyaudio.broken = False
+
+    threading.Thread(target=_replace_with_different_device_shortly_after, daemon=True).start()
+
+    frame = next(audio.frames())
+
+    assert frame is not None
+    assert audio._resolved_stable_id == "Different USB Mic"
+    assert fake_pyaudio.pyaudio_init_calls == 2, "Tier 2 must reconstruct PyAudio exactly once, not repeatedly"
+    audio.stop()
+
+
+def test_tier2_rediscovery_never_attempted_in_pinned_mode(fake_pyaudio, monkeypatch):
+    """Pinned mode must never silently substitute a different physical
+    microphone, even when Tier 1 is fully exhausted and a different device
+    is genuinely available -- it must fail visibly instead."""
+    audio = _make_manager(monkeypatch, max_errors=1, max_reopen=2, backoff=(0.01,) * 2,
+                           microphone_mode="pinned", microphone_pin="Fake USB Mic")
+    audio.start()
+    assert fake_pyaudio.pyaudio_init_calls == 1
+
+    fake_pyaudio.broken = True
+    fake_pyaudio.cards_present = False
+    fake_pyaudio.different_usb_present = True
+    fake_pyaudio.device_list = [dict(DIFFERENT_USB_MIC)]
+    fake_pyaudio._write_cards()
+
+    with pytest.raises(MicrophoneRecoveryFailedError):
+        next(audio.frames())
+
+    assert fake_pyaudio.pyaudio_init_calls == 1, "pinned mode must never reconstruct PyAudio for rediscovery"
+    audio.stop()
+
+
+def test_tier2_skipped_entirely_when_no_usb_audio_hardware_at_all(fake_pyaudio, monkeypatch):
+    """Tier 2 must not even attempt to reconstruct PyAudio when the OS
+    shows no USB audio hardware whatsoever -- the exact condition
+    Milestone 7 found fatal for repeated PyAudio() construction."""
+    audio = _make_manager(monkeypatch, max_errors=1, max_reopen=2, backoff=(0.01,) * 2,
+                           microphone_mode="auto")
+    audio.start()
+
+    fake_pyaudio.broken = True
+    fake_pyaudio.cards_present = False
+    fake_pyaudio.different_usb_present = False  # nothing USB at all
+    fake_pyaudio._write_cards()
+
+    with pytest.raises(MicrophoneRecoveryFailedError):
+        next(audio.frames())
+
+    assert fake_pyaudio.pyaudio_init_calls == 1, "must never reconstruct PyAudio with zero USB hardware present"
     audio.stop()
 
 

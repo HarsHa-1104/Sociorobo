@@ -15,12 +15,26 @@
 # (scripts/setup_uno_q.sh prints the discovered values).
 
 audio:
-  input_device_index: 0   # Milestone 8 (Priority 3): was 2, but the USB mic's PyAudio index
-                           # shifted to 0 after this session's WirePlumber restarts/lightdm stop
-                           # (same underlying ALSA-renumbering root cause as the output_device fix
-                           # above) -- confirmed via `python -m voice.audio.list_devices`. PyAudio
-                           # indices aren't guaranteed stable across audio-stack reconfiguration;
-                           # re-verify with the same command if the mic ever stops opening.
+  microphone_mode: "auto"   # Plug-and-play Phase 2 (default, shipped explicitly for clarity --
+                           # this is also the dataclass default, so this line isn't load-bearing).
+                           # "auto": every start()/recovery discovers every currently-available
+                           # USB/ALSA microphone (via voice/audio/discovery.py + selection.py)
+                           # and picks the best one by stable identity (ALSA card name) -- no
+                           # config edit needed when the physical mic changes. "pinned" restricts
+                           # selection to exactly microphone_pin and fails clearly instead of
+                           # substituting another device if it's absent -- debugging/special
+                           # deployments only.
+  microphone_pin: null      # Only consulted when microphone_mode: "pinned". A stable_id from
+                           # voice/audio/discovery.py -- an ALSA card name, e.g.
+                           # "Audio Array AM-C28 Device". NOT a raw PyAudio index.
+  input_device_index: 0   # Legacy, debug-only -- NOT consulted by microphone_mode "auto"/"pinned".
+                           # Milestone 8 (Priority 3) history: was 2, but the USB mic's PyAudio
+                           # index shifted to 0 after a WirePlumber restart/lightdm stop (same
+                           # underlying ALSA-renumbering root cause as the output_device fix
+                           # below) -- exactly the instability plug-and-play Phase 2 replaces
+                           # stable-identity discovery for. Kept only so
+                           # voice/audio/list_devices.py's output stays meaningful for manual
+                           # low-level debugging.
   output_device: "plughw:CARD=ArduinoImolaHPH,DEV=3"
     # Milestone 5 finding: this codec's hw params only support RATE
     # [32000, 48000] -- Piper's native output is 22050Hz. A raw "hw:" device

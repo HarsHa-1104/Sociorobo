@@ -112,6 +112,7 @@ def _pw_dump_result(objects, returncode: int = 0, stderr: str = ""):
 class _FakePyAudioHost:
     def __init__(self, devices):
         self._devices = devices
+        self.terminate_call_count = 0
 
     def get_device_count(self):
         return len(self._devices)
@@ -120,7 +121,7 @@ class _FakePyAudioHost:
         return self._devices[i]
 
     def terminate(self):
-        pass
+        self.terminate_call_count += 1
 
 
 def _fake_pyaudio_module(devices):
@@ -316,6 +317,38 @@ def test_merges_pyaudio_and_pipewire_entries_for_the_same_physical_mic(monkeypat
     assert d.pyaudio_index == 0  # from PyAudio
     assert d.pipewire_node_name == USB_MIC_SOURCE["info"]["props"]["node.name"]  # from PipeWire
     assert d.stable_id == "Audio Array AM-C28 Device"
+
+
+def test_reused_pyaudio_host_is_not_constructed_fresh_or_terminated(monkeypatch):
+    """Phase 2 safety requirement: when a caller passes its own already-open
+    PyAudio host, discovery must use it as-is and must NOT call terminate()
+    on it -- that's the caller's (AudioManager's) responsibility, since
+    terminating a host out from under its owner would break an active
+    capture stream."""
+    fake_host = _FakePyAudioHost(REAL_UNO_Q_PYAUDIO_DEVICES)
+
+    def _fail_if_constructed():
+        raise AssertionError("discovery must not construct its own PyAudio() when a host is supplied")
+
+    monkeypatch.setattr(discovery, "pyaudio", types.SimpleNamespace(PyAudio=_fail_if_constructed))
+    _no_pipewire_devices(monkeypatch)
+
+    devices = discovery.discover_input_devices(pyaudio_host=fake_host)
+    assert len(devices) == 1
+    assert devices[0].stable_id == "Audio Array AM-C28 Device"
+    assert fake_host.terminate_call_count == 0
+
+
+def test_own_pyaudio_host_is_still_terminated_when_not_reusing(monkeypatch):
+    """Regression guard: the reuse feature must not accidentally leak the
+    host discovery constructs for itself in the normal (no host passed)
+    case -- that would be a real resource leak."""
+    fake_host = _FakePyAudioHost(REAL_UNO_Q_PYAUDIO_DEVICES)
+    monkeypatch.setattr(discovery, "pyaudio", types.SimpleNamespace(PyAudio=lambda: fake_host))
+    _no_pipewire_devices(monkeypatch)
+
+    discovery.discover_input_devices()
+    assert fake_host.terminate_call_count == 1
 
 
 def test_discover_all_devices_combines_input_and_output(monkeypatch):

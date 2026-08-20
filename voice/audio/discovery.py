@@ -202,12 +202,30 @@ def _discover_pipewire_devices(role: str) -> list[DeviceDescriptor]:
 # PyAudio/PortAudio discovery
 # ---------------------------------------------------------------------------
 
-def _discover_pyaudio_devices(role: str) -> list[DeviceDescriptor]:
+def _discover_pyaudio_devices(role: str, pyaudio_host: Optional["pyaudio.PyAudio"] = None) -> list[DeviceDescriptor]:
     """Enumerate PyAudio devices with at least one channel in the requested
     direction, restricted to genuine hardware-backed ALSA devices (see
     _HW_DEVICE_NAME_RE). Returns [] (with a logged warning) if PyAudio isn't
     installed, rather than raising -- discovery should never crash a caller
     just because one of its two sources is unavailable.
+
+    If `pyaudio_host` is given, it is used as-is (never constructed or
+    terminated here) instead of creating a fresh `pyaudio.PyAudio()`
+    instance. Two reasons a caller should pass one, both from real-hardware
+    findings on this board:
+
+      * Cost: constructing a PyAudio host measured at ~364ms (Phase 0
+        benchmark) -- callers that already hold a live host (e.g.
+        AudioManager, which keeps one open for its whole lifetime) should
+        reuse it rather than pay that again on every discovery call.
+      * Safety: voice/audio/manager.py's own recovery logic (Milestone 7)
+        found that repeatedly constructing/tearing down
+        `pyaudio.PyAudio()` while a USB device was physically absent
+        crashed the whole process with no Python-level exception at all.
+        Recovery code must never let discovery construct a second,
+        independent PyAudio host of its own -- reusing the caller's
+        already-initialized one sidesteps that risk entirely, the same way
+        AudioManager's own recovery already never re-constructs its host.
     """
     if pyaudio is None:
         logger.warning("pyaudio is not installed -- skipping PyAudio-based discovery.")
@@ -215,7 +233,7 @@ def _discover_pyaudio_devices(role: str) -> list[DeviceDescriptor]:
 
     channel_key = "maxInputChannels" if role == "input" else "maxOutputChannels"
 
-    pa = pyaudio.PyAudio()
+    pa = pyaudio_host if pyaudio_host is not None else pyaudio.PyAudio()
     devices = []
     try:
         for i in range(pa.get_device_count()):
@@ -244,7 +262,8 @@ def _discover_pyaudio_devices(role: str) -> list[DeviceDescriptor]:
                 connected=True,
             ))
     finally:
-        pa.terminate()
+        if pyaudio_host is None:
+            pa.terminate()  # only terminate a host we constructed ourselves
 
     return devices
 
@@ -253,7 +272,7 @@ def _discover_pyaudio_devices(role: str) -> list[DeviceDescriptor]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def discover_input_devices() -> list[DeviceDescriptor]:
+def discover_input_devices(pyaudio_host: Optional["pyaudio.PyAudio"] = None) -> list[DeviceDescriptor]:
     """All currently-discoverable microphones: PyAudio-visible ALSA devices,
     merged with whatever PipeWire also reports for the same physical device
     (enriching it with a pipewire_node_name), plus any device only PipeWire
@@ -265,8 +284,14 @@ def discover_input_devices() -> list[DeviceDescriptor]:
     stable_id is ambiguous (duplicate hardware, see KNOWN LIMITATION above),
     every matching entry from both sources is returned separately rather than
     guessing a pairing.
+
+    Pass `pyaudio_host` to reuse an existing, already-initialized PyAudio
+    host instance instead of constructing a new one -- see
+    _discover_pyaudio_devices' docstring for why this matters (cost and,
+    during recovery, safety). Callers holding a long-lived host (like
+    AudioManager) should always pass it.
     """
-    pyaudio_devices = _discover_pyaudio_devices("input")
+    pyaudio_devices = _discover_pyaudio_devices("input", pyaudio_host=pyaudio_host)
     pipewire_devices = _discover_pipewire_devices("input")
 
     pyaudio_by_id: dict[str, list[DeviceDescriptor]] = defaultdict(list)

@@ -35,7 +35,23 @@ except ImportError:  # pragma: no cover - yaml is an optional convenience dep
 class AudioConfig:
     """Shared microphone / speaker configuration."""
 
-    input_device_index: Optional[int] = None  # None = system default; set explicitly on UNO Q
+    microphone_mode: str = "auto"  # Plug-and-play Phase 2: "auto" (default) discovers every
+                               # currently-available USB/ALSA microphone (via
+                               # voice/audio/discovery.py + selection.py) and picks the best
+                               # one by stable identity (ALSA card name) -- no config edit
+                               # needed when the physical mic changes. "pinned" restricts
+                               # selection to exactly one device (see microphone_pin) and fails
+                               # clearly rather than substituting another device if it's
+                               # absent -- for debugging/special deployments only.
+    microphone_pin: Optional[str] = None  # Only consulted when microphone_mode == "pinned". A
+                               # stable_id (see voice/audio/discovery.py) -- an ALSA card name,
+                               # e.g. "Audio Array AM-C28 Device". NOT a raw PyAudio index (see
+                               # input_device_index below for why that can't be reused here).
+    input_device_index: Optional[int] = None  # Legacy, debug-only. A raw PyAudio index is NOT
+                               # a stable identity (proven unstable across reboots/reconnects,
+                               # Milestone 8) and is never consulted by microphone_mode
+                               # "auto"/"pinned" -- kept only so voice/audio/list_devices.py's
+                               # output stays meaningful for manual low-level debugging.
     output_device: str = "default"  # ALSA device string for aplay; NOT the Jetson "hw:0,3" default
     sample_rate: int = 16000
     channels: int = 1
