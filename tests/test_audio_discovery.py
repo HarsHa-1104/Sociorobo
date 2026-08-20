@@ -30,6 +30,7 @@ USB_MIC_SOURCE = {
         "media.class": "Audio/Source",
         "device.api": "alsa",
         "api.alsa.card.name": "Audio Array AM-C28 Device",
+        "alsa.driver_name": "snd_usb_audio",
         "node.name": "alsa_input.usb-Audio_Array_Audio_Array_AM-C28_Device_2023-08-22-0001-00.analog-stereo",
         "node.description": "Audio Array AM-C28 Device Analog Stereo",
         "audio.channels": 2,
@@ -319,6 +320,22 @@ def test_merges_pyaudio_and_pipewire_entries_for_the_same_physical_mic(monkeypat
     assert d.stable_id == "Audio Array AM-C28 Device"
 
 
+def test_include_alsa_false_never_touches_pyaudio_at_all(monkeypatch):
+    """Safety escape hatch used by voice/audio/manager.py's Bluetooth
+    recovery when no USB audio hardware is present at all -- must not
+    construct a PyAudio host under any circumstance, only report
+    PipeWire-sourced (Bluetooth) candidates."""
+    def _fail_if_touched(*a, **k):
+        raise AssertionError("include_alsa=False must never touch pyaudio at all")
+
+    monkeypatch.setattr(discovery, "pyaudio", types.SimpleNamespace(PyAudio=_fail_if_touched))
+    monkeypatch.setattr(discovery, "run_with_group_kill", lambda *a, **k: _pw_dump_result([BLUETOOTH_MIC_SOURCE]))
+
+    devices = discovery.discover_input_devices(include_alsa=False)
+    assert len(devices) == 1
+    assert devices[0].backend == "bluez5"
+
+
 def test_reused_pyaudio_host_is_not_constructed_fresh_or_terminated(monkeypatch):
     """Phase 2 safety requirement: when a caller passes its own already-open
     PyAudio host, discovery must use it as-is and must NOT call terminate()
@@ -349,6 +366,20 @@ def test_own_pyaudio_host_is_still_terminated_when_not_reusing(monkeypatch):
 
     discovery.discover_input_devices()
     assert fake_host.terminate_call_count == 1
+
+
+def test_merge_copies_alsa_driver_from_pipewire_side_onto_the_merged_descriptor(monkeypatch):
+    """Regression test: the merged descriptor for an ALSA input must carry
+    alsa_driver (only ever populated on the PipeWire side) through to the
+    final result -- without this, every wired USB microphone would
+    misreport no driver and be misranked as the lowest class-priority
+    tier by voice/audio/selection.py, incorrectly losing to a Bluetooth
+    microphone candidate."""
+    monkeypatch.setattr(discovery, "pyaudio", _fake_pyaudio_module([REAL_UNO_Q_PYAUDIO_DEVICES[0]]))
+    monkeypatch.setattr(discovery, "run_with_group_kill", lambda *a, **k: _pw_dump_result([USB_MIC_SOURCE]))
+    devices = discovery.discover_input_devices()
+    assert len(devices) == 1
+    assert devices[0].alsa_driver == "snd_usb_audio"
 
 
 def test_discover_all_devices_combines_input_and_output(monkeypatch):

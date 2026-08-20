@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from voice.audio.discovery import DeviceDescriptor
 
@@ -106,14 +106,28 @@ class DeviceSelector:
         *,
         mode: str = "auto",
         pin: Optional[str] = None,
+        is_allowed: Optional[Callable[[DeviceDescriptor], bool]] = None,
     ) -> DeviceDescriptor:
         """Raises SelectionError if no candidate can be chosen -- callers
         must not catch this and substitute a device on their own; the
         caller's job is to fail the operation (or, if it has an explicitly
         documented separate fallback path, use that -- never invent one
-        here)."""
+        here).
+
+        `is_allowed`, if given, is applied FIRST, before mode/pin logic --
+        a hard external constraint (e.g. voice/audio/combination.py's "at
+        most one side may be Bluetooth" product rule) that a candidate
+        must satisfy to be selectable AT ALL, even in "pinned" mode. A
+        pinned device that fails `is_allowed` is treated exactly like a
+        pinned device that isn't present -- SelectionError, never a
+        silent substitution -- because the whole point of an external hard
+        constraint is that it can't be overridden by a manual pin either.
+        """
         if mode not in ("auto", "pinned"):
             raise ValueError(f"Unknown selection mode: {mode!r} (must be 'auto' or 'pinned')")
+
+        if is_allowed is not None:
+            candidates = [d for d in candidates if is_allowed(d)]
 
         if not candidates:
             raise SelectionError("No usable devices were discovered for this role.")

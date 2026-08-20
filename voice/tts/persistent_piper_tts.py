@@ -35,6 +35,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from voice.audio.combination import ComboGuard
 from voice.audio.discovery import discover_output_devices, pipewire_reachable
 from voice.audio.selection import SelectionError, make_output_selector
 from voice.config import TTSConfig
@@ -50,8 +51,15 @@ class PersistentPiperTTS:
     side benefits from staying resident).
     """
 
-    def __init__(self, config: TTSConfig) -> None:
+    def __init__(self, config: TTSConfig, combo_guard: Optional[ComboGuard] = None) -> None:
         self.config = config
+        # Shared with AudioManager (via build_voice_manager) so speaker
+        # selection can see which backend the microphone is currently
+        # using and enforce the "at most one side may be Bluetooth"
+        # product rule (voice/audio/combination.py). None (the default)
+        # means no cross-role constraint is applied -- used by tests and
+        # any standalone use of this class that doesn't need it.
+        self._combo_guard = combo_guard
         self.binary = Path(config.binary_path)
         self.model = Path(config.model_path)
         self.model_json = (
@@ -246,11 +254,20 @@ class PersistentPiperTTS:
         (None, failure_reason) on failure. failure_reason is one of:
         "pipewire_unreachable" (pw-dump itself is missing/erroring/timing
         out -- discovery can't even ask PipeWire), "no_devices" (PipeWire
-        is fine, it just currently has zero sinks), or "selection_failed"
-        (candidates exist but the configured pin doesn't match any of
-        them). Distinguishing "pipewire_unreachable" from "no_devices"
-        matters because only the former is eligible for the aplay
-        fallback in play() -- see that method's docstring.
+        is fine, it just currently has zero sinks), "bluetooth_conflict"
+        (every currently available output is Bluetooth, but the
+        microphone is already using Bluetooth -- Bluetooth mic + Bluetooth
+        speaker is not a supported combination, see
+        voice/audio/combination.py), or "selection_failed" (candidates
+        exist but the configured pin doesn't match any of them, or none
+        pass some other constraint). Distinguishing "pipewire_unreachable"
+        from the rest matters because only that one is eligible for the
+        aplay fallback in play() -- see that method's docstring. None of
+        the others fall back to aplay: they all mean a real device
+        landscape was seen and rejected for a specific reason, not that
+        PipeWire itself is unusable, so silently degrading to a fixed
+        ALSA device would be exactly the "unintended device" this design
+        exists to avoid.
         """
         candidates = discover_output_devices()
         if not candidates:
@@ -258,13 +275,33 @@ class PersistentPiperTTS:
                 return None, "no_devices"
             return None, "pipewire_unreachable"
 
+        is_allowed = (
+            (lambda d: self._combo_guard.speaker_allowed(d.backend))
+            if self._combo_guard is not None else None
+        )
         pin = self.config.speaker_pin or self.config.bluetooth_speaker_mac
         try:
-            chosen = self._output_selector.select(candidates, mode=self.config.speaker_mode, pin=pin)
+            chosen = self._output_selector.select(
+                candidates, mode=self.config.speaker_mode, pin=pin, is_allowed=is_allowed,
+            )
         except SelectionError as exc:
+            if (
+                self._combo_guard is not None
+                and self._combo_guard.microphone_backend == "bluez5"
+                and all(d.backend == "bluez5" for d in candidates)
+            ):
+                logger.error(
+                    "Speaker selection failed: every currently available output "
+                    "is Bluetooth, but the microphone is already using Bluetooth -- "
+                    "Bluetooth mic + Bluetooth speaker is not a supported "
+                    "combination. (%s)", exc,
+                )
+                return None, "bluetooth_conflict"
             logger.error("Speaker selection failed: %s", exc)
             return None, "selection_failed"
 
+        if self._combo_guard is not None:
+            self._combo_guard.set_speaker_backend(chosen.backend)
         return chosen.pipewire_node_name, None
 
     def _play_via_aplay(self, pcm_bytes: bytes, alsa_device: str) -> bool:

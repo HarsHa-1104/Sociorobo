@@ -234,6 +234,84 @@ def test_play_fails_visibly_when_pipewire_reports_zero_devices_no_aplay_fallback
         tts.shutdown()
 
 
+def test_play_respects_combo_guard_excludes_bluetooth_speaker_when_mic_is_bluetooth(fake_config):
+    """Combination requirement: if the microphone is already using
+    Bluetooth (reported via ComboGuard), speaker auto-selection must skip
+    Bluetooth candidates entirely and fall through to a wired one."""
+    from voice.audio.combination import ComboGuard
+
+    guard = ComboGuard()
+    guard.set_microphone_backend("bluez5")
+    tts = PersistentPiperTTS(fake_config, combo_guard=guard)
+    try:
+        with mock.patch("voice.tts.persistent_piper_tts.discover_output_devices",
+                         return_value=[_USB_SPEAKER, _HBTS001]), \
+             mock.patch("voice.tts.pipewire_playback.play_via_pipewire", return_value=True) as play_mock:
+            ok = tts.play(b"\x00\x00" * 100, alsa_device="plughw:CARD=Test,DEV=3")
+        assert ok is True
+        assert play_mock.call_args[0][2] == "alsa_output.usb"  # USB, not Bluetooth
+    finally:
+        tts.shutdown()
+
+
+def test_play_reports_bluetooth_conflict_clearly_when_only_bluetooth_speaker_available(fake_config):
+    """The one explicitly unsupported combination: mic already Bluetooth,
+    and the ONLY available speaker is also Bluetooth. Must fail clearly
+    (never silently substitute, never crash) and the app must remain
+    usable afterward (no exception escapes, no process left running)."""
+    from voice.audio.combination import ComboGuard
+
+    guard = ComboGuard()
+    guard.set_microphone_backend("bluez5")
+    tts = PersistentPiperTTS(fake_config, combo_guard=guard)
+    try:
+        with mock.patch("voice.tts.persistent_piper_tts.discover_output_devices",
+                         return_value=[_HBTS001]), \
+             mock.patch("voice.subprocess_utils.run_with_group_kill") as aplay_mock, \
+             mock.patch("voice.tts.pipewire_playback.play_via_pipewire") as pw_play_mock:
+            target, reason = tts._resolve_output_target()
+            ok = tts.play(b"\x00\x00" * 100, alsa_device="plughw:CARD=Test,DEV=3")
+        assert target is None
+        assert reason == "bluetooth_conflict"
+        assert ok is False
+        aplay_mock.assert_not_called()
+        pw_play_mock.assert_not_called()
+        # The guard itself must not record a false Bluetooth+Bluetooth
+        # state -- the rejected speaker pick was never actually adopted.
+        assert guard.is_bluetooth_conflict() is False
+    finally:
+        tts.shutdown()
+
+
+def test_successful_speaker_selection_reports_its_backend_to_the_combo_guard(fake_config):
+    from voice.audio.combination import ComboGuard
+
+    guard = ComboGuard()
+    tts = PersistentPiperTTS(fake_config, combo_guard=guard)
+    try:
+        with mock.patch("voice.tts.persistent_piper_tts.discover_output_devices",
+                         return_value=[_HBTS001]), \
+             mock.patch("voice.tts.pipewire_playback.play_via_pipewire", return_value=True):
+            tts.play(b"\x00\x00" * 100, alsa_device="plughw:CARD=Test,DEV=3")
+        assert guard.speaker_backend == "bluez5"
+    finally:
+        tts.shutdown()
+
+
+def test_no_combo_guard_behaves_exactly_as_before_backward_compatible(fake_config):
+    """Constructing PersistentPiperTTS without a combo_guard (every
+    existing caller/test) must be completely unaffected by this feature."""
+    tts = PersistentPiperTTS(fake_config)
+    try:
+        with mock.patch("voice.tts.persistent_piper_tts.discover_output_devices",
+                         return_value=[_USB_SPEAKER, _HBTS001]), \
+             mock.patch("voice.tts.pipewire_playback.play_via_pipewire", return_value=True) as play_mock:
+            tts.play(b"\x00\x00" * 100, alsa_device="plughw:CARD=Test,DEV=3")
+        assert play_mock.call_args[0][2] == "bluez_output.B3_BB_BE_7F_9B_1A.1"  # unrestricted class-priority pick
+    finally:
+        tts.shutdown()
+
+
 def test_play_falls_back_to_aplay_only_when_pipewire_itself_is_unreachable(fake_config):
     """The ONLY scenario where the legacy aplay/ALSA path may still run:
     PipeWire itself is missing/erroring (not just "no sinks right now")."""

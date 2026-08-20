@@ -32,6 +32,7 @@ import threading
 import time
 from typing import Optional
 
+from voice.audio.combination import ComboGuard
 from voice.audio.manager import AudioManager
 from voice.audio.vad import SegmentEvent, SpeechSegmenter
 from voice.config import VoiceSystemConfig
@@ -298,7 +299,14 @@ def build_voice_manager(config: VoiceSystemConfig) -> VoiceManager:
     depend on real audio hardware / subprocess binaries just by
     constructing a VoiceManager.
     """
-    audio = AudioManager(config.audio)
+    # Combination requirement: at most one of {microphone, speaker} may be
+    # Bluetooth at a time (voice/audio/combination.py) -- a product rule,
+    # not a technical limitation of any specific device. One ComboGuard is
+    # shared by both roles for this VoiceManager's whole lifetime so each
+    # side's device selection can see what the other is currently using.
+    combo_guard = ComboGuard()
+
+    audio = AudioManager(config.audio, combo_guard=combo_guard)
     # Both of these consume frames from audio.frames(), which always yields
     # PIPELINE_SAMPLE_RATE (16kHz) audio regardless of the raw mic capture
     # rate (config.audio.sample_rate, 48kHz on this board) -- see the note
@@ -319,8 +327,11 @@ def build_voice_manager(config: VoiceSystemConfig) -> VoiceManager:
     # is the only place the choice is made.
     if config.tts.persistent:
         from voice.tts.persistent_piper_tts import PersistentPiperTTS
-        tts = PersistentPiperTTS(config.tts)
+        tts = PersistentPiperTTS(config.tts, combo_guard=combo_guard)
     else:
+        # PiperTTS (non-persistent, not the production default) has no
+        # device discovery/selection of its own -- always aplay/ALSA --
+        # so there is no Bluetooth backend for it to coordinate on.
         tts = PiperTTS(config.tts)
 
     return VoiceManager(config, audio, wake_detector, segmenter, stt, llm, tts)

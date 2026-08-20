@@ -32,8 +32,39 @@ import types
 
 import pytest
 
-from voice.audio.manager import AudioManager, MicrophoneRecoveryFailedError
+from voice.audio.combination import ComboGuard
+from voice.audio.manager import AudioManager, MicrophoneRecoveryFailedError, MicrophoneUnavailableError
+from voice.audio.pw_capture import CaptureStartError
 from voice.config import AudioConfig
+
+BLUETOOTH_MIC_SOURCE = {
+    "info": {"props": {
+        "media.class": "Audio/Source",
+        "device.api": "bluez5",
+        "api.bluez5.address": "AA:BB:CC:DD:EE:FF",
+        "node.name": "bluez_input.AA_BB_CC_DD_EE_FF",
+        "node.description": "Fake BT Headset",
+        "audio.channels": 1,
+    }},
+}
+
+# The PipeWire-side counterpart of FAKE_USB_MIC (see discovery.py's merge
+# logic: only merging with a matching PipeWire ALSA entry populates
+# alsa_driver, which class-priority ranking needs to correctly classify a
+# device as "alsa-usb" rather than the lower-priority "alsa-other" --
+# exactly what real hardware validation confirmed for the Audio Array.
+# Without this, these fakes would misrepresent real device-merge behavior.
+FAKE_USB_MIC_PW_SOURCE = {
+    "info": {"props": {
+        "media.class": "Audio/Source",
+        "device.api": "alsa",
+        "api.alsa.card.name": "Fake USB Mic",
+        "alsa.driver_name": "snd_usb_audio",
+        "node.name": "alsa_input.fake_usb_mic",
+        "node.description": "Fake USB Mic",
+        "audio.channels": 1,
+    }},
+}
 
 
 class _FakeStream:
@@ -111,6 +142,41 @@ class _FakePyAudio:
         self.owner.terminate_calls += 1
 
 
+class _FakePipeWireCapture:
+    """Stands in for voice.audio.pw_capture.PipeWireCapture -- constructed
+    fresh on every open/handoff attempt (matching the real class's usage
+    pattern in manager.py), so instance-level state (started/stopped)
+    correctly reflects THIS attempt, while owner-level flags
+    (bt_fail_start/bt_broken) let a test control behavior across attempts."""
+
+    def __init__(self, target_node, rate, channels, owner):
+        self.target_node = target_node
+        self.rate = rate
+        self.channels = channels
+        self.owner = owner
+        self.started = False
+        self.stopped = False
+        owner.bt_instances.append(self)
+
+    def start(self):
+        self.owner.bt_start_calls += 1
+        if self.owner.bt_fail_start:
+            raise CaptureStartError("fake pw-record start failure")
+        self.started = True
+
+    def read(self, num_bytes, timeout_s=1.0):
+        if self.owner.bt_broken or self.stopped:
+            return None
+        return bytes(num_bytes)
+
+    def is_alive(self):
+        return self.started and not self.stopped
+
+    def stop(self):
+        self.owner.bt_stop_calls += 1
+        self.stopped = True
+
+
 class _Owner:
     """Shared mutable state the fakes reference, so a test can flip
     `broken`/`fail_reopen`/`cards_present` mid-run to simulate
@@ -128,6 +194,13 @@ class _Owner:
         self.cards_present = True  # whether /proc/asound/cards (faked) currently shows the ORIGINAL USB card
         self.different_usb_present = False  # whether it instead shows a DIFFERENT USB card (Tier 2 territory)
         self.device_list = [dict(FAKE_USB_MIC)]  # what discovery currently finds via PyAudio enumeration
+        self.pw_dump_objects = [dict(FAKE_USB_MIC_PW_SOURCE)]  # PipeWire's view -- matches device_list's default so the merge gives it the correct "alsa-usb" class priority (see comment above)
+        # Bluetooth capture (PipeWireCapture) fake state:
+        self.bt_fail_start = False
+        self.bt_broken = False  # read() returns None (EOF/timeout) when True
+        self.bt_instances = []  # every _FakePipeWireCapture ever constructed, for assertions
+        self.bt_start_calls = 0
+        self.bt_stop_calls = 0
 
 
 @pytest.fixture
@@ -159,10 +232,17 @@ def fake_pyaudio(monkeypatch, tmp_path):
     owner._write_cards = _write_cards  # let tests re-trigger a write after flipping cards_present
     monkeypatch.setattr(AudioManager, "ASOUND_CARDS_PATH", str(cards_path))
 
-    # Discovery also queries pw-dump for Bluetooth/PipeWire input candidates
-    # -- irrelevant to these PyAudio/ALSA-focused tests, so make it a no-op
-    # (empty result) rather than letting it hit a real subprocess.
-    monkeypatch.setattr("voice.audio.discovery._run_pw_dump", lambda: [])
+    # Discovery also queries pw-dump for Bluetooth/PipeWire input candidates.
+    # Reads owner.pw_dump_objects live (empty by default -- irrelevant for
+    # ALSA-only tests), so a test can inject a Bluetooth source by setting
+    # it, without hitting a real subprocess.
+    monkeypatch.setattr("voice.audio.discovery._run_pw_dump", lambda: list(owner.pw_dump_objects))
+
+    # PipeWireCapture (Bluetooth backend) is faked the same way PyAudio is.
+    monkeypatch.setattr(
+        "voice.audio.manager.PipeWireCapture",
+        lambda target, rate, channels: _FakePipeWireCapture(target, rate, channels, owner),
+    )
 
     return owner
 
@@ -530,3 +610,222 @@ def test_presence_check_never_blocks_configs_without_a_captured_signature(fake_p
     frame = next(audio.frames())
     assert frame is not None
     audio.stop()
+
+
+# ---------------------------------------------------------------------------
+# Bluetooth backend (combination-support extension)
+# ---------------------------------------------------------------------------
+
+def test_start_opens_bluetooth_backend_when_only_bluetooth_candidate_present(fake_pyaudio, monkeypatch):
+    fake_pyaudio.device_list = []  # no wired mic at all
+    fake_pyaudio.pw_dump_objects = [BLUETOOTH_MIC_SOURCE]
+    audio = _make_manager(monkeypatch)
+    audio.start()
+    try:
+        assert audio._active_backend == "bluez5"
+        assert audio._resolved_stable_id == "AA:BB:CC:DD:EE:FF"
+        assert audio._resolved_pyaudio_index is None
+        assert fake_pyaudio.bt_start_calls == 1
+        frame = next(audio.frames())
+        assert frame is not None
+    finally:
+        audio.stop()
+    assert fake_pyaudio.bt_stop_calls == 1
+
+
+def test_start_prefers_wired_mic_over_bluetooth_when_both_present(fake_pyaudio, monkeypatch):
+    fake_pyaudio.pw_dump_objects = [FAKE_USB_MIC_PW_SOURCE, BLUETOOTH_MIC_SOURCE]  # device_list already has FAKE_USB_MIC by default
+    audio = _make_manager(monkeypatch)
+    audio.start()
+    try:
+        assert audio._active_backend == "alsa"
+        assert audio._resolved_stable_id == "Fake USB Mic"
+    finally:
+        audio.stop()
+
+
+def test_bluetooth_start_fails_clearly_when_capture_produces_no_data(fake_pyaudio, monkeypatch):
+    fake_pyaudio.device_list = []
+    fake_pyaudio.pw_dump_objects = [BLUETOOTH_MIC_SOURCE]
+    fake_pyaudio.bt_broken = True  # started, but read() always returns None
+    audio = _make_manager(monkeypatch)
+    with pytest.raises(MicrophoneUnavailableError):
+        audio.start()
+    assert fake_pyaudio.bt_stop_calls == 1, "a capture that never proved it works must still be cleaned up"
+
+
+def test_bluetooth_start_fails_clearly_when_pw_record_missing(fake_pyaudio, monkeypatch):
+    fake_pyaudio.device_list = []
+    fake_pyaudio.pw_dump_objects = [BLUETOOTH_MIC_SOURCE]
+    fake_pyaudio.bt_fail_start = True
+    audio = _make_manager(monkeypatch)
+    with pytest.raises(MicrophoneUnavailableError):
+        audio.start()
+
+
+def test_bluetooth_recovery_retries_and_succeeds(fake_pyaudio, monkeypatch):
+    audio = _make_manager(monkeypatch, max_errors=1, max_reopen=3, backoff=(0.01,) * 3)
+    fake_pyaudio.device_list = []
+    fake_pyaudio.pw_dump_objects = [BLUETOOTH_MIC_SOURCE]
+    audio.start()
+    assert audio._active_backend == "bluez5"
+
+    fake_pyaudio.bt_broken = True
+
+    def _unbreak_soon():
+        time.sleep(0.03)
+        fake_pyaudio.bt_broken = False
+
+    threading.Thread(target=_unbreak_soon, daemon=True).start()
+
+    frame = next(audio.frames())
+    assert frame is not None
+    assert audio._active_backend == "bluez5"
+    audio.stop()
+
+
+def test_bluetooth_recovery_hands_off_to_alsa_when_wired_mic_appears(fake_pyaudio, monkeypatch):
+    """Started on Bluetooth (no wired mic at boot). It breaks, and a wired
+    mic appears in the meantime -- recovery must prefer and switch to it
+    (USB > Bluetooth class priority), not keep retrying Bluetooth."""
+    audio = _make_manager(monkeypatch, max_errors=1, max_reopen=6, backoff=(0.01,) * 6)
+    fake_pyaudio.device_list = []
+    fake_pyaudio.pw_dump_objects = [BLUETOOTH_MIC_SOURCE]
+    audio.start()
+    assert audio._active_backend == "bluez5"
+
+    fake_pyaudio.bt_broken = True
+
+    def _wired_mic_appears_shortly_after():
+        time.sleep(0.02)  # comfortably inside the 6*0.01s=60ms recovery window
+        fake_pyaudio.device_list = [dict(FAKE_USB_MIC)]
+        fake_pyaudio.pw_dump_objects = [dict(FAKE_USB_MIC_PW_SOURCE), BLUETOOTH_MIC_SOURCE]
+
+    threading.Thread(target=_wired_mic_appears_shortly_after, daemon=True).start()
+
+    frame = next(audio.frames())
+    assert frame is not None
+    assert audio._active_backend == "alsa"
+    assert audio._resolved_stable_id == "Fake USB Mic"
+    assert audio._pw_capture is None, "no Bluetooth capture should remain referenced after switching to ALSA"
+    # Every Bluetooth capture instance ever constructed (the original from
+    # start(), plus one per failed attempt before the wired mic appeared)
+    # must have been stopped -- none abandoned running.
+    assert all(inst.stopped for inst in fake_pyaudio.bt_instances)
+    audio.stop()
+
+
+def test_alsa_tier2_hands_off_to_bluetooth_when_that_is_the_best_remaining_candidate(fake_pyaudio, monkeypatch):
+    """Started on the wired mic. It disappears permanently, but a
+    Bluetooth mic is discoverable and the OS still shows SOME USB audio
+    hardware (satisfying the Milestone 7 safety gate for reconstructing
+    PyAudio) -- Tier 2 must hand off to Bluetooth rather than just
+    failing."""
+    audio = _make_manager(monkeypatch, max_errors=1, max_reopen=2, backoff=(0.01,) * 2)
+    audio.start()
+    assert audio._active_backend == "alsa"
+
+    fake_pyaudio.broken = True
+    fake_pyaudio.cards_present = False          # original wired mic: gone
+    fake_pyaudio.different_usb_present = True   # but SOME USB audio hardware is still visible (safety gate passes)
+    fake_pyaudio.device_list = []               # ...yet PyAudio enumerates no usable input device for it
+    fake_pyaudio.pw_dump_objects = [BLUETOOTH_MIC_SOURCE]
+    fake_pyaudio._write_cards()
+
+    frame = next(audio.frames())
+    assert frame is not None
+    assert audio._active_backend == "bluez5"
+    assert audio._resolved_stable_id == "AA:BB:CC:DD:EE:FF"
+    audio.stop()
+
+
+def test_bluetooth_recovery_never_constructs_pyaudio_when_no_usb_hardware_present(fake_pyaudio, monkeypatch):
+    """Same Milestone 7-motivated safety gate as ALSA Tier 2
+    (_any_usb_audio_card_present), applied to Bluetooth recovery's own
+    per-attempt PyAudio construction: when the OS shows no USB audio
+    hardware at all, never construct a PyAudio host, even though this
+    loop normally does so on every attempt to see wired candidates."""
+    audio = _make_manager(monkeypatch, max_errors=1, max_reopen=3, backoff=(0.01,) * 3)
+    fake_pyaudio.device_list = []
+    fake_pyaudio.pw_dump_objects = [BLUETOOTH_MIC_SOURCE]
+    audio.start()
+    assert fake_pyaudio.pyaudio_init_calls == 1
+
+    fake_pyaudio.bt_broken = True
+    fake_pyaudio.cards_present = False
+    fake_pyaudio.different_usb_present = False  # no USB hardware at all, even a different one
+    fake_pyaudio._write_cards()
+
+    with pytest.raises(MicrophoneRecoveryFailedError):
+        next(audio.frames())
+
+    assert fake_pyaudio.pyaudio_init_calls == 1, (
+        "Bluetooth recovery must not construct a new PyAudio host while "
+        "no USB audio hardware is visible to the OS at all"
+    )
+    audio.stop()
+
+
+def test_bluetooth_capture_is_stopped_when_audio_manager_stops(fake_pyaudio, monkeypatch):
+    fake_pyaudio.device_list = []
+    fake_pyaudio.pw_dump_objects = [BLUETOOTH_MIC_SOURCE]
+    audio = _make_manager(monkeypatch)
+    audio.start()
+    audio.stop()
+    assert fake_pyaudio.bt_stop_calls == 1
+    assert audio._pw_capture is None
+
+
+# ---------------------------------------------------------------------------
+# Combination guard integration (at most one of {mic, speaker} may be Bluetooth)
+# ---------------------------------------------------------------------------
+
+def test_microphone_selection_excludes_bluetooth_when_speaker_already_bluetooth(fake_pyaudio, monkeypatch):
+    guard = ComboGuard()
+    guard.set_speaker_backend("bluez5")
+    fake_pyaudio.device_list = []  # no wired mic -- Bluetooth would otherwise be the only candidate
+    fake_pyaudio.pw_dump_objects = [BLUETOOTH_MIC_SOURCE]
+
+    monkeypatch.setattr(AudioManager, "MAX_CONSECUTIVE_READ_ERRORS", 3)
+    monkeypatch.setattr(AudioManager, "MAX_REOPEN_ATTEMPTS", 3)
+    monkeypatch.setattr(AudioManager, "REOPEN_BACKOFF_S", (0.02,) * 3)
+    audio = AudioManager(_fast_config(), combo_guard=guard)
+
+    with pytest.raises(MicrophoneUnavailableError):
+        audio.start()
+
+
+def test_microphone_selection_allows_bluetooth_when_speaker_is_wired(fake_pyaudio, monkeypatch):
+    guard = ComboGuard()
+    guard.set_speaker_backend("alsa")
+    fake_pyaudio.device_list = []
+    fake_pyaudio.pw_dump_objects = [BLUETOOTH_MIC_SOURCE]
+
+    audio = AudioManager(_fast_config(), combo_guard=guard)
+    audio.start()
+    try:
+        assert audio._active_backend == "bluez5"
+    finally:
+        audio.stop()
+
+
+def test_successful_microphone_selection_reports_its_backend_to_the_combo_guard(fake_pyaudio, monkeypatch):
+    guard = ComboGuard()
+    audio = AudioManager(_fast_config(), combo_guard=guard)
+    audio.start()
+    try:
+        assert guard.microphone_backend == "alsa"
+    finally:
+        audio.stop()
+
+
+def test_no_combo_guard_behaves_exactly_as_before_backward_compatible(fake_pyaudio, monkeypatch):
+    """Constructing AudioManager without a combo_guard (every existing
+    caller/test) must be completely unaffected by this feature."""
+    fake_pyaudio.pw_dump_objects = [FAKE_USB_MIC_PW_SOURCE, BLUETOOTH_MIC_SOURCE]  # BT present, but irrelevant -- no guard means no filtering
+    audio = _make_manager(monkeypatch)
+    audio.start()
+    try:
+        assert audio._active_backend == "alsa"  # unrestricted class-priority pick, same as always
+    finally:
+        audio.stop()

@@ -272,7 +272,10 @@ def _discover_pyaudio_devices(role: str, pyaudio_host: Optional["pyaudio.PyAudio
 # Public API
 # ---------------------------------------------------------------------------
 
-def discover_input_devices(pyaudio_host: Optional["pyaudio.PyAudio"] = None) -> list[DeviceDescriptor]:
+def discover_input_devices(
+    pyaudio_host: Optional["pyaudio.PyAudio"] = None,
+    include_alsa: bool = True,
+) -> list[DeviceDescriptor]:
     """All currently-discoverable microphones: PyAudio-visible ALSA devices,
     merged with whatever PipeWire also reports for the same physical device
     (enriching it with a pipewire_node_name), plus any device only PipeWire
@@ -290,8 +293,18 @@ def discover_input_devices(pyaudio_host: Optional["pyaudio.PyAudio"] = None) -> 
     _discover_pyaudio_devices' docstring for why this matters (cost and,
     during recovery, safety). Callers holding a long-lived host (like
     AudioManager) should always pass it.
+
+    Pass `include_alsa=False` to skip the PyAudio-based side entirely --
+    never constructs or touches a PyAudio host at all, regardless of
+    `pyaudio_host`, and returns only PipeWire-sourced results (Bluetooth,
+    plus any ALSA node PipeWire reports on its own). Existing for exactly
+    one reason: a caller in a context where constructing a fresh
+    pyaudio.PyAudio() would be unsafe (voice/audio/manager.py's Bluetooth
+    recovery, when no USB audio hardware is present at all -- the one
+    condition Milestone 7 confirmed can crash the process) still needs to
+    see Bluetooth candidates without paying that risk.
     """
-    pyaudio_devices = _discover_pyaudio_devices("input", pyaudio_host=pyaudio_host)
+    pyaudio_devices = _discover_pyaudio_devices("input", pyaudio_host=pyaudio_host) if include_alsa else []
     pipewire_devices = _discover_pipewire_devices("input")
 
     pyaudio_by_id: dict[str, list[DeviceDescriptor]] = defaultdict(list)
@@ -309,6 +322,17 @@ def discover_input_devices(pyaudio_host: Optional["pyaudio.PyAudio"] = None) -> 
                 pa_dev,
                 pipewire_node_name=pw_dev.pipewire_node_name,
                 channels=pw_dev.channels or pa_dev.channels,
+                # alsa_driver only ever exists on the PipeWire-sourced side
+                # (_pipewire_descriptor_from_props) -- pa_dev's own is
+                # always None, so it must be copied explicitly here or a
+                # merged ALSA input descriptor would always misreport no
+                # driver, which voice/audio/selection.py's class-priority
+                # ranking relies on to tell a USB device from a built-in
+                # one (a real bug this exact merge step used to have:
+                # every wired USB microphone would rank as the lowest
+                # "alsa-other" tier instead of "alsa-usb", incorrectly
+                # losing priority to a Bluetooth microphone candidate).
+                alsa_driver=pw_dev.alsa_driver or pa_dev.alsa_driver,
             ))
             consumed.add(id(pa_dev))
         else:

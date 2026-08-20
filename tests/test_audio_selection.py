@@ -181,6 +181,43 @@ def test_pinned_mode_with_no_pin_configured_fails_clearly():
         selector.select([USB_SPEAKER], mode="pinned", pin=None)
 
 
+# ---------------------------------------------------------------------------
+# is_allowed external constraint (used by voice/audio/combination.py)
+# ---------------------------------------------------------------------------
+
+def test_is_allowed_filters_out_disallowed_candidates_in_auto_mode():
+    selector = make_output_selector()
+    chosen = selector.select(
+        [HBTS001, USB_SPEAKER], mode="auto",
+        is_allowed=lambda d: d.backend != "bluez5",
+    )
+    assert chosen is USB_SPEAKER
+
+
+def test_is_allowed_rejecting_everything_raises_selection_error():
+    selector = make_output_selector()
+    with pytest.raises(SelectionError):
+        selector.select([HBTS001], mode="auto", is_allowed=lambda d: d.backend != "bluez5")
+
+
+def test_is_allowed_applies_even_in_pinned_mode_never_overridden_by_a_pin():
+    """The whole point of an external hard constraint is that a manual pin
+    cannot bypass it -- pinning a disallowed device must fail exactly like
+    pinning an absent one, never silently succeed."""
+    selector = make_output_selector()
+    with pytest.raises(SelectionError):
+        selector.select(
+            [HBTS001, USB_SPEAKER], mode="pinned", pin="B3:BB:BE:7F:9B:1A",
+            is_allowed=lambda d: d.backend != "bluez5",
+        )
+
+
+def test_is_allowed_none_means_no_extra_filtering_backward_compatible():
+    selector = make_output_selector()
+    chosen = selector.select([HBTS001, USB_SPEAKER], mode="auto", is_allowed=None)
+    assert chosen is HBTS001  # normal class-priority behavior, unaffected
+
+
 def test_pinned_mode_never_falls_back_to_a_different_device_after_failure():
     """Regression guard for the exact failure mode the design explicitly
     forbids: a missing pinned device must never result in some OTHER device
