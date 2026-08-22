@@ -33,3 +33,8 @@ scikit-learn==1.9.0
 tqdm==4.70.0
 openwakeword==0.6.0
 ai-edge-litert>=2.0.2,<3
+
+# motion/ (HC-05 manual Bluetooth control) -- real serial I/O for
+# HC05Controller (motion/hc05_controller.py). Not used by the voice
+# pipeline itself; only scripts/run_motion_controller.py imports it.
+pyserial==3.5
