@@ -23,6 +23,7 @@ import logging
 import threading
 from typing import Callable, Optional
 
+from motion.movement_controller import DEFAULT_SPEED, MAX_SPEED
 from motion.safety_gate import MovementSafetyGate
 
 logger = logging.getLogger(__name__)
@@ -44,15 +45,27 @@ def _default_serial_factory(port: str, baudrate: int, read_timeout_s: float) -> 
 
 
 class HC05Controller:
-    """Command mapping defaults to single uppercase ASCII characters
-    (F/B/L/R/S), the convention used by the great majority of "Bluetooth
-    RC Car"-style Android apps (e.g. the widely-used "Arduino Bluetooth RC
-    Car" / "Bluetooth Electronics"-style controller apps send exactly
-    this). VERIFY this against whichever specific app you actually use --
-    override `command_map` if it sends something different (some apps use
-    'G' or 'W' for a neutral/stop state, some use lowercase, some send
-    multi-byte sequences -- this controller only handles single-byte
-    commands as-is; a multi-byte protocol would need a different parser).
+    """Command mapping defaults to single uppercase ASCII characters --
+    F/B/L/R for the four cardinal directions, G/H/I/J for the four
+    diagonals (forward_right/backward_right/backward_left/forward_left
+    respectively), S for stop. This F/B/L/R/G/H/I/J/S letter scheme is a
+    real, documented convention used by several widely-forked open-source
+    "Bluetooth RC Car" Arduino/Android app pairs -- but it is NOT verified
+    against any specific app until physically tested (see
+    docs/HC05_COMMAND_DISCOVERY.md's capture procedure). Override `command_map` if
+    your app sends something different (some apps use digits/a numpad
+    layout for direction instead of letters -- see the module docstring's
+    note about the default speed_map using digits, which would collide
+    with a digit-based direction scheme; if your app uses digits for
+    direction, override BOTH command_map and speed_map to avoid a clash).
+
+    Speed defaults to a separate `speed_map`: single ASCII digits '0'-'9'
+    map to a 10-level PWM speed (0..MAX_SPEED), the convention used by
+    many Bluetooth RC apps' speed sliders (which typically quantise to a
+    small number of discrete levels before sending a single byte). Also
+    NOT verified against any specific app -- override if different.
+    Updates the speed used by the NEXT direction command; sending a speed
+    byte alone never moves the car by itself.
 
     9600 baud is the HC-05 factory default (a documented hardware fact,
     not a guess) -- override `baudrate` if the module was reconfigured.
@@ -63,9 +76,18 @@ class HC05Controller:
         "B": "backward",
         "L": "left",
         "R": "right",
+        "G": "forward_right",
+        "H": "backward_right",
+        "I": "backward_left",
+        "J": "forward_left",
         "S": "stop",
-        "G": "stop",  # some apps use a distinct "neutral/stop" character
     }
+
+    # 10-level speed convention (digit '0'..'9' -> 0..MAX_SPEED), the
+    # default only -- override via `speed_map` if your app sends speed
+    # differently (e.g. a raw 0-255 byte, a different digit range, or no
+    # separate speed byte at all).
+    DEFAULT_SPEED_MAP: dict[str, int] = {str(i): (i * MAX_SPEED) // 9 for i in range(10)}
 
     READ_TIMEOUT_S = 0.5  # bounds each read() call so the reader thread can observe stop_flag promptly
     RECONNECT_BACKOFF_S = 1.0  # pause between reconnect attempts after a read failure, to avoid a hot error loop
@@ -76,13 +98,16 @@ class HC05Controller:
         port: str,
         baudrate: int = 9600,
         command_map: Optional[dict[str, str]] = None,
+        speed_map: Optional[dict[str, int]] = None,
         serial_factory: Optional[Callable[[str, int, float], SerialPort]] = None,
     ) -> None:
         self._gate = gate
         self._port = port
         self._baudrate = baudrate
         self._command_map = dict(command_map) if command_map is not None else dict(self.DEFAULT_COMMAND_MAP)
+        self._speed_map = dict(speed_map) if speed_map is not None else dict(self.DEFAULT_SPEED_MAP)
         self._serial_factory = serial_factory or _default_serial_factory
+        self._current_speed = DEFAULT_SPEED
 
         self._ser: Optional[SerialPort] = None
         self._stop_flag = threading.Event()
@@ -163,21 +188,32 @@ class HC05Controller:
         if not char:
             return  # whitespace/newline/non-ASCII noise -- ignore silently, not an error
 
+        # Speed bytes are checked first and never fall through to the
+        # direction map -- updating speed must never itself move the car.
+        if char in self._speed_map:
+            self._current_speed = self._speed_map[char]
+            logger.info("HC-05: speed set to %d.", self._current_speed)
+            return
+
         action = self._command_map.get(char)
         if action is None:
             logger.warning("HC-05: unrecognised command byte %r -- ignoring (no unsafe fallback).", char)
             return
 
-        if action == "forward":
-            self._gate.request_forward()
-        elif action == "backward":
-            self._gate.request_backward()
-        elif action == "left":
-            self._gate.request_left()
-        elif action == "right":
-            self._gate.request_right()
-        elif action == "stop":
+        dispatch = {
+            "forward": self._gate.request_forward,
+            "backward": self._gate.request_backward,
+            "left": self._gate.request_left,
+            "right": self._gate.request_right,
+            "forward_left": self._gate.request_forward_left,
+            "forward_right": self._gate.request_forward_right,
+            "backward_left": self._gate.request_backward_left,
+            "backward_right": self._gate.request_backward_right,
+        }
+        if action == "stop":
             self._gate.stop()
+        elif action in dispatch:
+            dispatch[action](self._current_speed)
         else:  # pragma: no cover - defensive; only reachable via a misconfigured command_map
             logger.error("HC-05: command_map entry %r -> %r is not a recognised action -- ignoring.", char, action)
 

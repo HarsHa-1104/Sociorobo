@@ -68,7 +68,7 @@ def _wait_until(predicate, timeout_s=2.0):
 
 
 # ---------------------------------------------------------------------------
-# 1-5: each command byte -> the correct motion request
+# 1-8: each command byte -> the correct motion request (4 cardinal + 4 diagonal)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("byte,expected", [
@@ -76,8 +76,11 @@ def _wait_until(predicate, timeout_s=2.0):
     (b"B", "backward"),
     (b"L", "left"),
     (b"R", "right"),
+    (b"G", "forward_right"),
+    (b"H", "backward_right"),
+    (b"I", "backward_left"),
+    (b"J", "forward_left"),
     (b"S", "stop"),
-    (b"G", "stop"),
 ])
 def test_command_byte_dispatches_to_the_correct_action(byte, expected):
     port = _FakeSerialPort()
@@ -132,8 +135,11 @@ def test_whitespace_and_non_ascii_noise_is_ignored_silently():
 
 
 def test_custom_command_map_overrides_the_default():
+    """Digit keys are used here deliberately, together with an explicitly
+    empty speed_map -- proving command_map and speed_map are independent
+    and each fully overridable (see the next test for the reverse case)."""
     port = _FakeSerialPort()
-    ctrl, gate, movement = _controller(port, command_map={"1": "forward", "0": "stop"})
+    ctrl, gate, movement = _controller(port, command_map={"1": "forward", "0": "stop"}, speed_map={})
     ctrl.start()
     try:
         port.push(b"1")
@@ -141,6 +147,56 @@ def test_custom_command_map_overrides_the_default():
         port.push(b"F")  # the DEFAULT forward byte -- must NOT dispatch under a custom map
         time.sleep(0.2)
         assert movement.call_count == 1, "a byte outside the custom map must be ignored, not fall back to the default map"
+    finally:
+        ctrl.stop()
+
+
+def test_custom_speed_map_overrides_the_default_independently_of_command_map():
+    port = _FakeSerialPort()
+    ctrl, gate, movement = _controller(port, speed_map={"X": 42})
+    ctrl.start()
+    try:
+        port.push(b"X")
+        time.sleep(0.1)
+        assert movement.call_count == 0, "setting speed must never itself move the car"
+
+        port.push(b"F")  # default command_map is untouched by the custom speed_map
+        assert _wait_until(lambda: movement.last_command == "forward")
+        assert movement.last_speed == 42
+    finally:
+        ctrl.stop()
+
+
+def test_default_speed_map_digit_zero_through_nine_scales_to_the_pwm_range():
+    port = _FakeSerialPort()
+    ctrl, gate, movement = _controller(port)
+    ctrl.start()
+    try:
+        port.push(b"9")  # max speed level
+        port.push(b"F")
+        assert _wait_until(lambda: movement.last_command == "forward")
+        assert movement.last_speed == 255
+
+        port.push(b"0")  # min speed level
+        port.push(b"F")
+        assert _wait_until(lambda: movement.last_speed == 0)
+    finally:
+        ctrl.stop()
+
+
+def test_speed_persists_across_multiple_direction_commands_until_changed():
+    port = _FakeSerialPort()
+    ctrl, gate, movement = _controller(port)
+    ctrl.start()
+    try:
+        port.push(b"5")
+        port.push(b"F")
+        assert _wait_until(lambda: movement.last_command == "forward")
+        expected_speed = movement.last_speed
+
+        port.push(b"L")
+        assert _wait_until(lambda: movement.last_command == "left")
+        assert movement.last_speed == expected_speed, "speed must persist until a new speed byte is sent"
     finally:
         ctrl.stop()
 

@@ -1,0 +1,3 @@
+name: Motion Controller
+icon: 🚗
+description: HC-05 Bluetooth manual driving for a 4-wheel mecanum car, with an immediate wake-word safety stop coordinated with the voice pipeline over IPC.

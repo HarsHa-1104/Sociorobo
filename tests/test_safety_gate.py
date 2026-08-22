@@ -181,6 +181,26 @@ def test_concurrent_requests_and_suppression_never_leave_movement_after_stop():
         )
 
 
+# ---------------------------------------------------------------------------
+# suppress()/release() are forwarded to the underlying MovementController --
+# required for a backend (like the real hardware) whose manual-command
+# source doesn't route through THIS gate at all.
+# ---------------------------------------------------------------------------
+
+def test_suppress_and_stop_calls_movement_suppress_before_stop():
+    gate, movement = _gate()
+    gate.suppress_and_stop()
+    assert movement.is_suppressed is True
+
+
+def test_release_calls_movement_release():
+    gate, movement = _gate()
+    gate.suppress_and_stop()
+    assert movement.is_suppressed is True
+    gate.release()
+    assert movement.is_suppressed is False
+
+
 def test_is_suppressed_reflects_current_state_thread_safely():
     gate, _ = _gate()
     assert gate.is_suppressed is False

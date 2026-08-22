@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from motion.movement_controller import MovementController
+from motion.movement_controller import DEFAULT_SPEED, MovementController
 
 logger = logging.getLogger(__name__)
 
@@ -60,27 +60,39 @@ class MovementSafetyGate:
     # ------------------------------------------------------------------
     # HC-05 manual-control side: gated requests.
     # ------------------------------------------------------------------
-    def request_forward(self) -> None:
-        self._request(self._movement.forward, "forward")
+    def request_forward(self, speed: int = DEFAULT_SPEED) -> None:
+        self._request(self._movement.forward, "forward", speed)
 
-    def request_backward(self) -> None:
-        self._request(self._movement.backward, "backward")
+    def request_backward(self, speed: int = DEFAULT_SPEED) -> None:
+        self._request(self._movement.backward, "backward", speed)
 
-    def request_left(self) -> None:
-        self._request(self._movement.left, "left")
+    def request_left(self, speed: int = DEFAULT_SPEED) -> None:
+        self._request(self._movement.left, "left", speed)
 
-    def request_right(self) -> None:
-        self._request(self._movement.right, "right")
+    def request_right(self, speed: int = DEFAULT_SPEED) -> None:
+        self._request(self._movement.right, "right", speed)
 
-    def _request(self, fn, name: str) -> None:
+    def request_forward_left(self, speed: int = DEFAULT_SPEED) -> None:
+        self._request(self._movement.forward_left, "forward_left", speed)
+
+    def request_forward_right(self, speed: int = DEFAULT_SPEED) -> None:
+        self._request(self._movement.forward_right, "forward_right", speed)
+
+    def request_backward_left(self, speed: int = DEFAULT_SPEED) -> None:
+        self._request(self._movement.backward_left, "backward_left", speed)
+
+    def request_backward_right(self, speed: int = DEFAULT_SPEED) -> None:
+        self._request(self._movement.backward_right, "backward_right", speed)
+
+    def _request(self, fn, name: str, speed: int) -> None:
         with self._lock:
             if self._suppressed:
                 logger.info(
-                    "Movement request %r ignored -- voice interaction "
-                    "currently owns movement state.", name,
+                    "Movement request %r (speed=%d) ignored -- voice interaction "
+                    "currently owns movement state.", name, speed,
                 )
                 return
-            fn()
+            fn(speed)
 
     # ------------------------------------------------------------------
     # stop() is never gated -- always safe, always allowed, from any
@@ -97,11 +109,18 @@ class MovementSafetyGate:
     # Voice-pipeline side, via the IPC server's injected callbacks.
     # ------------------------------------------------------------------
     def suppress_and_stop(self) -> None:
-        """Called on PAUSE_REQUEST (wake word confirmed). Sets suppression
-        FIRST, then stops, both under the same lock acquisition -- see the
-        class docstring for why this ordering, combined with every
+        """Called on PAUSE_REQUEST (wake word confirmed). Sets the LOCAL
+        suppression flag, tells the underlying MovementController to
+        suppress too (see MovementController.suppress()'s docstring for
+        why this matters for backends where manual commands never pass
+        through THIS gate at all -- e.g. HC-05 wired directly to the
+        sketch), then stops -- all under the same lock acquisition. See
+        the class docstring for why this ordering, combined with every
         request_*() acquiring the same lock, is what makes "stop always
-        wins the race" true rather than just intended.
+        wins the race" true rather than just intended (that guarantee is
+        specifically about THIS gate's own request_*() callers; it says
+        nothing about a backend's own independent command source, which
+        is exactly why suppress() exists as a separate, explicit signal).
 
         Idempotent: calling this again while already suppressed (e.g. a
         second wake word fires before the first session completes) simply
@@ -110,20 +129,26 @@ class MovementSafetyGate:
         """
         with self._lock:
             self._suppressed = True
+            self._movement.suppress()
             self._movement.stop()
         logger.info("MovementSafetyGate: suppressed and stopped for voice interaction.")
 
     def release(self) -> None:
         """Called on VOICE_SESSION_COMPLETE, or by the IPC watchdog if
-        voice fails to complete a session at all. ONLY clears the
-        suppression flag -- never re-issues a movement command. The car
-        remains stopped (motors were already stopped by
-        suppress_and_stop() and nothing since has moved them) until a new
-        Bluetooth command arrives. This is the load-bearing implementation
-        of "do not automatically resume the previous movement direction."
+        voice fails to complete a session at all. Clears the LOCAL
+        suppression flag and tells the underlying MovementController to
+        release too -- but this is NOT "re-issuing a movement command":
+        MovementController.release() is explicitly documented to never
+        move the motors or resume prior motion by itself, only to stop
+        actively refusing new manual commands. The car remains stopped
+        (motors were already stopped by suppress_and_stop() and nothing
+        since has moved them) until a new Bluetooth command arrives. This
+        is the load-bearing implementation of "do not automatically
+        resume the previous movement direction."
         """
         with self._lock:
             self._suppressed = False
+            self._movement.release()
         logger.info("MovementSafetyGate: released -- manual control available again "
                      "(car remains stopped until a new command arrives).")
 
