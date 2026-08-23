@@ -138,6 +138,8 @@ class WhisperCppSTT:
                     "-t", str(self.config.threads),
                     "-l", self.config.language,
                     "-ac", str(audio_ctx),
+                    "-bs", "1",
+                    "-bo", "1",
                     "--no-timestamps",
                     "-np",
                 ],
